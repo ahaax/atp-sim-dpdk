@@ -20,6 +20,13 @@ typedef struct {
     bool     collision;
     bool     from_switch;
     bool     resend;          /* 新增：是否为重传包 */
+    /* 
+     * 修复 B 新增：交换机结果包需要携带聚合器内的 bitmap 和 count，
+     * 以便 PS 端判断这是"部分聚合"还是"完整聚合"，并做去重。
+     */
+    uint32_t bitmap;          /* 该包代表哪些 Worker 的聚合（原始包为 1<<worker_id） */
+    uint8_t  count;           /* 该包包含几个 Worker 的和（原始包为 1） */
+
 } atp_packet_t;
 
 /* 聚合器槽位：job_id == 0 表示空闲，不需要额外的 occupied 字段 */
@@ -108,7 +115,7 @@ static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
 /* 
  * 处理重传包（论文 §3.7 核心）
  * 一级交换机行为：若聚合器存在，合并该 Worker（如未合并过），
- *                然后强制把结果（可能部分聚合）发给 PS，释放槽位。
+ *                然后强制把结果（  可能部分聚合）发给 PS，释放槽位。
  */
 static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
 {
@@ -122,6 +129,12 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
             slot->bitmap |= (1u << pkt->worker_id);
             slot->count++;
         }
+
+        /*
+         * 修复 B：交换机结果包必须携带聚合器当前的 bitmap 和 count，
+         * 让 PS 知道这是"部分聚合"还是"完整聚合"。
+         */
+
         atp_packet_t result = {
             .job_id = pkt->job_id,
             .seq = pkt->seq,
@@ -129,7 +142,9 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
             .data = slot->sum,
             .fan_in = pkt->fan_in,
             .collision = false,
-            .from_switch = true
+            .from_switch = true,
+            .bitmap = slot->bitmap,
+            .count = slot->count
         };
         send_to_ps(sw, &result);
         printf("  [Switch] 槽位%2d 重传解救: Job%d Seq%d 部分聚合=%d -> 强制发PS并释放\n",
@@ -140,7 +155,7 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
     }
 
     /* 聚合器已不存在（可能被 ACK 释放或超时清理过）：直接转发原始包到 PS */
-    printf("  [Switch] 槽位%2d 重传转发: 聚合器已释放，原始包直发PS\n", idx);
+    printf("  [Switch] 槽位%2d 重传转发: 聚合器已释放, 原始包直发PS\n", idx);
     send_to_ps(sw, pkt);
 }
 
@@ -169,10 +184,20 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
     /* ---- 路径 A：槽位空闲 (job_id == 0) -> FCFS 预留 ---- *///⭐是/必须是FCFS吗?
     if (slot->job_id == 0) {  /* 修复1：用 job_id==0 判断空闲，job_id会从1开始,0默认无效 */
+       /* 
+        * 新增：检查这个 (job_id, seq) 是否已经被"重传解救"过。
+        * 如果已经被解救过，后续同 Seq 的包不再预留，直接转发到 PS。
+        */
+        if (was_resend_recovered(pkt->job_id, pkt->seq)) {
+            send_to_ps(sw, pkt);  // 直接转发，不再聚合
+            return;
+        }
+       
+       
         slot->job_id = pkt->job_id;
         slot->seq = pkt->seq;
         slot->sum = pkt->data;
-        slot->bitmap = (1u << pkt->worker_id);//1U 是一个无符号整数常量，表示值为 1 的无符号整型。它通常用于需要确保数值为非负的场景
+        slot->bitmap = pkt->bitmap; //(1u << pkt->worker_id);//1U 是一个无符号整数常量，表示值为 1 的无符号整型。它通常用于需要确保数值为非负的场景
         slot->count = 1;
         slot->timestamp = sw->global_time;
 
@@ -197,6 +222,9 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->timestamp = sw->global_time;
 
         if (slot->count >= pkt->fan_in) {
+            /*
+             * 修复 B：正常聚合完成时，结果包携带完整 bitmap 和 count。
+             */
             atp_packet_t result = {
                 .job_id = pkt->job_id,
                 .seq = pkt->seq,
@@ -205,7 +233,9 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
                 .data = slot->sum,
                 .fan_in = pkt->fan_in,
                 .collision = false,
-                .from_switch = true
+                .from_switch = true,
+                .bitmap = slot->bitmap,
+                .count = slot->count
             };
             send_to_ps(sw, &result);
 
@@ -257,6 +287,11 @@ void switch_scan_timeout(atp_switch_t *sw, uint64_t threshold)
  *函数用于处理来自交换机的多个数据包，聚合数据并检查是否收齐所有必要的包。
  *它维护一个缓冲区以存储和更新每个作业的状态，
  *并在处理完成或未收齐时输出相应的日志信息。
+ * 
+ * 修复 A：增加 entry->done 前置检查，防止交换机结果包先到、原始 fallback 包后到
+ *         导致的重复累加。
+ * 修复 B：交换机结果包携带 bitmap/count，PS 端用通用 bitmap 去重逻辑处理，
+ *         支持"部分聚合结果"的正确累加，不再盲目认为 from_switch=true 就是完整结果。
  */
 
 void ps_process(atp_switch_t *sw)
@@ -286,31 +321,52 @@ void ps_process(atp_switch_t *sw)
             entry->fan_in = pkt->fan_in;
         }
 
-        /* 修复2：交换机预聚合结果包（from_switch=true）直接收工，
-         * 避免 worker_id=0xFF 导致 bitmap 移位溢出 */
-        if (pkt->from_switch) {
-            entry->sum = pkt->data;
-            entry->count = entry->fan_in;
-            entry->done = true;
-            printf("  [PS] 聚合完成: Job%d Seq%d = %d (交换机预聚合)\n",
-                   entry->job_id, entry->seq, entry->sum);
+        /* ========== 修复 A：如果该 (job, seq) 已经被标记为 done，直接忽略后续一切包 ========== */
+        if (entry->done) {
             continue;
         }
-        //去重/防重复包
-        if (entry->bitmap & (1u << pkt->worker_id)) {
+
+        /* ========== 修复 B：通用 bitmap 去重累加逻辑 ========== */
+        uint32_t overlap = entry->bitmap & pkt->bitmap;
+
+        if (overlap) {
+            /*
+             * 有重叠：说明 PS 已经收到了其中某些 Worker 的数据。
+             * 如果交换机结果包是"完整聚合"（count >= fan_in），直接用权威结果覆盖。
+             * 否则（部分聚合且有重叠），丢弃，因为无法拆分总和避免重复。
+             */
+            if (pkt->from_switch && pkt->count >= entry->fan_in) {
+                entry->sum = pkt->data;
+                entry->bitmap = pkt->bitmap;
+                entry->done = true;
+                printf("  [PS] 聚合完成: Job%d Seq%d = %d (交换机完整结果覆盖)\n",
+                       entry->job_id, entry->seq, entry->sum);
+            } else {
+                printf("  [PS] 丢弃重复: Job%d Seq%d (overlap bitmap=%u)\n",
+                       pkt->job_id, pkt->seq, overlap);
+            }
             continue;
         }
+
+        /* 无重叠：安全累加 */
         //fallback包，仍然是原始 worker 数据包，需要按 worker 去合并
         entry->sum += pkt->data;
-        entry->bitmap |= (1u << pkt->worker_id);
-        entry->count++;
+        entry->bitmap |= pkt->bitmap;
+        entry->count += pkt->count;  /* 修复 B：累计 count */
 
-        if (entry->count >= entry->fan_in && !entry->done) {
-            printf("  [PS] 聚合完成: Job%d Seq%d = %d (PS端回退聚合)\n",
-                   entry->job_id, entry->seq, entry->sum);
+        /* 检查是否收齐：用 bitmap 的 popcount 判断（比 count 更可靠） */
+        
+        uint32_t b = entry->bitmap;
+        uint8_t popcnt = 0;
+        while (b) { popcnt++; b &= b - 1; }  /* 计算 popcount */
+
+        if (popcnt >= entry->fan_in && !entry->done) {
+            printf("  [PS] 聚合完成: Job%d Seq%d = %d (PS端累加完成, bitmap=%u)\n",
+                   entry->job_id, entry->seq, entry->sum, entry->bitmap);
             entry->done = true;
         }
     }
+
 
     for (uint32_t j = 0; j < buf_cnt; j++) {
         if (!buf[j].done) {
@@ -347,7 +403,9 @@ static atp_packet_t make_pkt(uint32_t job, uint16_t seq, uint8_t wid, int val, u
     return (atp_packet_t){
         .job_id = job, .seq = seq, .worker_id = wid,
         .data = val, .fan_in = fan_in,
-        .collision = false, .from_switch = false, .resend = false
+        .collision = false, .from_switch = false, .resend = false,
+        .bitmap = (1u << wid), /* 原始包只代表自己这一个 Worker */
+        .count = 1
     };
 }
 
