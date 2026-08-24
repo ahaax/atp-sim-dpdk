@@ -11,6 +11,16 @@
  *  运行: ./atp_sim
  * ============================================================ */
 
+/* 记录已经被重传解救过的 <job_id, seq>，防止后续包再次预留形成孤儿聚合器 */
+#define RESCUED_MAX 256
+
+typedef struct {
+    uint32_t job_id;
+    uint16_t seq;
+} rescued_entry_t;
+
+
+
 typedef struct {
     uint32_t job_id;
     uint16_t seq;
@@ -49,6 +59,9 @@ typedef struct {
     uint64_t      fallback;
     uint64_t      completed;
     uint64_t      global_time;/* 新增：模拟全局时钟，每处理一个包+1 */
+    /* 新增：已解救表 */
+    rescued_entry_t rescued[RESCUED_MAX];
+    uint32_t        rescued_cnt;
 } atp_switch_t;
 
 #define PS_BUF_MAX 1024
@@ -67,6 +80,32 @@ typedef struct {
 static inline uint16_t hash_idx(uint32_t job_id, uint16_t seq, uint32_t pool_size)
 {
     return ((job_id * 31 + seq) % pool_size);
+}
+
+/* 检查该 <job, seq> 是否已经被重传解救过 */
+static bool is_rescued(atp_switch_t *sw, uint32_t job_id, uint16_t seq)
+{
+    for (uint32_t i = 0; i < sw->rescued_cnt; i++) {
+        if (sw->rescued[i].job_id == job_id && sw->rescued[i].seq == seq)
+            return true;
+    }
+    return false;
+}
+
+/* 标记该 <job, seq> 已被重传解救 */
+static void mark_rescued(atp_switch_t *sw, uint32_t job_id, uint16_t seq)
+{
+    if (sw->rescued_cnt >= RESCUED_MAX) {
+        /* 表满：简单处理，覆盖最旧的（FIFO），或扩容。仿真里直接忽略。 */
+        fprintf(stderr, "[Warn] rescued table full, dropping oldest entry\n");
+        /* 左移覆盖第一个 */
+        memmove(&sw->rescued[0], &sw->rescued[1], 
+                (RESCUED_MAX - 1) * sizeof(rescued_entry_t));
+        sw->rescued_cnt = RESCUED_MAX - 1;
+    }
+    sw->rescued[sw->rescued_cnt].job_id = job_id;
+    sw->rescued[sw->rescued_cnt].seq = seq;
+    sw->rescued_cnt++;
 }
 
 /*
@@ -146,11 +185,17 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
             .bitmap = slot->bitmap,
             .count = slot->count
         };
+        /* 强制发 PS 并释放槽位 */
         send_to_ps(sw, &result);
-        printf("  [Switch] 槽位%2d 重传解救: Job%d Seq%d 部分聚合=%d -> 强制发PS并释放\n",
-               idx, pkt->job_id, pkt->seq, slot->sum);
         memset(slot, 0, sizeof(*slot));
         sw->completed++;
+        
+        /* 新增：标记该 <job, seq> 已被解救，后续同 Seq 包禁止预留 */
+        mark_rescued(sw, pkt->job_id, pkt->seq);
+        
+        printf("  [Switch] 槽位%2d 重传解救并标记: Job%d Seq%d -> 后续禁止预留\n", idx, pkt->job_id, pkt->seq);
+        return;
+        
         return;
     }
 
@@ -184,16 +229,17 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
     /* ---- 路径 A：槽位空闲 (job_id == 0) -> FCFS 预留 ---- *///⭐是/必须是FCFS吗?
     if (slot->job_id == 0) {  /* 修复1：用 job_id==0 判断空闲，job_id会从1开始,0默认无效 */
-       /* 
-        * 新增：检查这个 (job_id, seq) 是否已经被"重传解救"过。
-        * 如果已经被解救过，后续同 Seq 的包不再预留，直接转发到 PS。
-        */
-        if (was_resend_recovered(pkt->job_id, pkt->seq)) {
-            send_to_ps(sw, pkt);  // 直接转发，不再聚合
+       
+        /* 新增：如果该 <job, seq> 已被重传解救过，说明聚合器曾经存在但被强制释放了。
+        * 此时不应再预留槽位（否则后续重传包会形成新的孤儿聚合器），直接转发到 PS。 */
+        if (is_rescued(sw, pkt->job_id, pkt->seq)) {
+            send_to_ps(sw, pkt);
+            printf("  [Switch] 槽位%2d 拒绝预留: Job%d Seq%d 已被重传解救过,直接发PS\n",
+                idx, pkt->job_id, pkt->seq);
             return;
         }
        
-       
+        // 正常预留
         slot->job_id = pkt->job_id;
         slot->seq = pkt->seq;
         slot->sum = pkt->data;
