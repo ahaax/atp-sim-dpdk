@@ -36,6 +36,9 @@ typedef struct {
      */
     uint32_t bitmap;          /* 该包代表哪些 Worker 的聚合（原始包为 1<<worker_id） */
     uint8_t  count;           /* 该包包含几个 Worker 的和（原始包为 1） */
+    
+    
+    bool ecn;             /* 新增：ECN 拥塞标记 */
 
 } atp_packet_t;
 
@@ -47,6 +50,7 @@ typedef struct {
     uint32_t bitmap;
     uint8_t  count;
     uint64_t timestamp;       /* 新增：最后更新时间（用全局时钟计数） */
+    bool    ecn;             /* 新增：聚合器累积的ECN状态 */
 } agg_slot_t;
 
 typedef struct {
@@ -62,6 +66,9 @@ typedef struct {
     /* 新增：已解救表 */
     rescued_entry_t rescued[RESCUED_MAX];
     uint32_t        rescued_cnt;
+
+    uint32_t       egress_queue_depth; /* 新增：出口队列深度，用于模拟拥塞 */
+    uint32_t       ecn_threshold;      /* 新增：ECN标记阈值*/
 } atp_switch_t;
 
 #define PS_BUF_MAX 1024
@@ -139,6 +146,10 @@ atp_switch_t* switch_create(uint32_t pool_size)
         return NULL;
     }
 
+    /*ECN*/
+    sw->egress_queue_depth = 0;
+    sw->ecn_threshold = 1; /* 默认的阈值, 测试中可覆盖 */
+
     return sw;
 }
 
@@ -149,6 +160,15 @@ static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
         exit(1);
     }
     sw->ps_queue[sw->ps_tail++] = *pkt;
+    sw->egress_queue_depth++; /* 模拟包进入出口队列，深度增加 */
+}
+
+/* 新增：根据出口队列深度标记 ECN */
+static inline void check_and_mark_ecn(atp_switch_t *sw, atp_packet_t *pkt)
+{
+    if (sw->egress_queue_depth > sw->ecn_threshold) {
+        pkt->ecn = true;
+    }
 }
 
 /* 
@@ -158,6 +178,8 @@ static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
  */
 static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
 {
+    check_and_mark_ecn(sw, pkt); /* 新增：检查出口队列深度，标记 ECN */
+
     uint16_t idx = hash_idx(pkt->job_id, pkt->seq, sw->pool_size);
     agg_slot_t *slot = &sw->pool[idx];
 
@@ -167,6 +189,8 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
             slot->sum += pkt->data;
             slot->bitmap |= (1u << pkt->worker_id);
             slot->count++;
+
+            slot->ecn |= pkt->ecn; /* 合并，累积 ECN 状态 */
         }
 
         /*
@@ -183,7 +207,8 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
             .collision = false,
             .from_switch = true,
             .bitmap = slot->bitmap,
-            .count = slot->count
+            .count = slot->count,
+            .ecn = slot->ecn  /* 新增：携带累积的 ECN 状态 */
         };
         /* 强制发 PS 并释放槽位 */
         send_to_ps(sw, &result);
@@ -196,11 +221,10 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
         printf("  [Switch] 槽位%2d 重传解救并标记: Job%d Seq%d -> 后续禁止预留\n", idx, pkt->job_id, pkt->seq);
         return;
         
-        return;
     }
 
     /* 聚合器已不存在（可能被 ACK 释放或超时清理过）：直接转发原始包到 PS */
-    printf("  [Switch] 槽位%2d 重传转发: 聚合器已释放, 原始包直发PS\n", idx);
+    printf("  [Switch] 槽位%2d 重传转发: 聚合器已释放, 原始包直发PS (ECN=%d)\n", idx, pkt->ecn);
     send_to_ps(sw, pkt);
 }
 
@@ -217,6 +241,8 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 {
 
     sw->global_time++;  /* 全局时钟推进 */
+    
+    check_and_mark_ecn(sw, pkt); /* 新增：检查出口队列是否堵塞 */
 
     /* 如果是重传包，走专门逻辑 */
     if (pkt->resend) {
@@ -244,6 +270,7 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->seq = pkt->seq;
         slot->sum = pkt->data;
         slot->bitmap = pkt->bitmap; //(1u << pkt->worker_id);//1U 是一个无符号整数常量，表示值为 1 的无符号整型。它通常用于需要确保数值为非负的场景
+        slot->ecn = pkt->ecn; /* 新增：继承包的 ECN 状态 */
         slot->count = 1;
         slot->timestamp = sw->global_time;
 
@@ -265,6 +292,7 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->sum += pkt->data;
         slot->bitmap |= (1u << pkt->worker_id);  //设为1，表示该worker已经贡献过数据
         slot->count++;
+        slot->ecn |= pkt->ecn; /* 新增：累积 ECN 状态 */
         slot->timestamp = sw->global_time;
 
         if (slot->count >= pkt->fan_in) {
@@ -281,12 +309,13 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
                 .collision = false,
                 .from_switch = true,
                 .bitmap = slot->bitmap,
-                .count = slot->count
+                .count = slot->count,
+                .ecn = slot->ecn  /* 新增：携带累积的 ECN 状态 */
             };
             send_to_ps(sw, &result);
 
-            printf("  [Switch] 槽位%2d 完成    : Job%d Seq%d -> 值=%d (发往PS)\n",
-                   idx, pkt->job_id, pkt->seq, slot->sum);
+            printf("  [Switch] 槽位%2d 完成    : Job%d Seq%d -> 值=%d (发往PS) (ECN=%d)\n",
+                   idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
 
             memset(slot, 0, sizeof(*slot)); /* 释放槽位 */
             sw->completed++;
@@ -303,10 +332,10 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
     send_to_ps(sw, pkt);
     sw->fallback++;
 
-    printf("  [Switch] 槽位%2d 冲突回退: 被Job%dSeq%d占用，"
-           "Job%dSeq%dWorker%d -> 直接发PS\n",
+    printf("  [Switch] 槽位%2d 冲突回退: 被Job%dSeq%d占用,"
+           "Job%dSeq%dWorker%d -> 直接发PS (ECN=%d)\n",
            idx, slot->job_id, slot->seq,
-           pkt->job_id, pkt->seq, pkt->worker_id);
+           pkt->job_id, pkt->seq, pkt->worker_id, pkt->ecn);
 }
 
 
@@ -370,6 +399,12 @@ void ps_process(atp_switch_t *sw)
         /* ========== 修复 A：如果该 (job, seq) 已经被标记为 done，直接忽略后续一切包 ========== */
         if (entry->done) {
             continue;
+        }
+
+        /* 新增：打印 ECN 拥塞信号 */
+        if (pkt->ecn) {
+            printf("  [PS] 检测到 ECN 标记: Job%d Seq%d (交换机出口拥塞)\n",
+                   pkt->job_id, pkt->seq);
         }
 
         /* ========== 修复 B：通用 bitmap 去重累加逻辑 ========== */
@@ -442,6 +477,7 @@ static void reset_switch(atp_switch_t *sw)
     sw->fallback = 0;
     sw->completed = 0;
     sw->global_time = 0;
+    sw->egress_queue_depth = 0;   
 }
 
 static atp_packet_t make_pkt(uint32_t job, uint16_t seq, uint8_t wid, int val, uint8_t fan_in)
@@ -451,7 +487,8 @@ static atp_packet_t make_pkt(uint32_t job, uint16_t seq, uint8_t wid, int val, u
         .data = val, .fan_in = fan_in,
         .collision = false, .from_switch = false, .resend = false,
         .bitmap = (1u << wid), /* 原始包只代表自己这一个 Worker */
-        .count = 1
+        .count = 1,
+        .ecn = false  /* 默认无 ECN */
     };
 }
 
@@ -581,6 +618,82 @@ void test5_orphan_timeout(void)
     print_stats(sw, 2);
 
     free(sw->pool); free(sw->ps_queue); free(sw);
+    printf("  [Note] Job1 数据已丢失，需 Worker 重传或 PS 请求重传才能恢复\n");
+    
+}
+
+/* ============================================================
+ *  新增 Test 6：验证 rescued 机制
+ * ============================================================ */
+void test6_rescued_mechanism(void)
+{
+    printf("\n\n########################################\n");
+    printf("TEST 6: 验证 rescued 机制（重传解救后，同 Job 同 Seq 的新包直发 PS）\n");
+    printf("########################################\n");
+
+    atp_switch_t *sw = switch_create(1);
+
+    /* 阶段1：制造冲突与孤儿聚合器 */
+    atp_packet_t pkts[] = {
+        make_pkt(1, 0, 0, 10, 2),   /* Job1 Seq0 W0 预留槽位0 */
+        make_pkt(2, 0, 0, 100, 2),  /* Job2 Seq0 W0 冲突 -> 回退PS */
+        make_pkt(1, 0, 1, 20, 2),   /* Job1 Seq0 W1 -> 完成，释放槽位0 */
+        make_pkt(2, 0, 1, 200, 2),  /* Job2 Seq0 W1 -> 预留槽位0（等W0） */
+    };
+    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
+        switch_process(sw, &pkts[i]);
+
+    /* 阶段2：W0 重传，解救孤儿聚合器 */
+    printf("\n  --- Job2 W0 超时重传，触发解救 ---\n");
+    atp_packet_t resend = make_pkt(2, 0, 0, 100, 2);
+    resend.resend = true;
+    switch_process(sw, &resend);
+
+    /* 阶段3：同 Job 同 Seq 的新包（非重传）到达 —— 应被直发 PS，禁止预留 */
+    printf("\n  --- Job2 Seq0 W0 新包（延迟到达/重复），应被直发 PS ---\n");
+    atp_packet_t late_pkt = make_pkt(2, 0, 0, 100, 2);
+    late_pkt.resend = false;
+    switch_process(sw, &late_pkt);
+
+    ps_process(sw);
+    print_stats(sw, 6);
+
+    free(sw->pool); free(sw->ps_queue); free(sw);
+}
+
+
+/* ============================================================
+ *  新增 Test 7：ECN 拥塞控制
+ * ============================================================ */
+void test7_ecn_congestion(void)
+{
+    printf("\n\n########################################\n");
+    printf("TEST 7: ECN 拥塞控制（出口队列深度超阈值标记 ECN）\n");
+    printf("########################################\n");
+
+    atp_switch_t *sw = switch_create(2);
+    sw->ecn_threshold = 1; /* 低阈值，便于触发拥塞标记 */
+
+    /* 
+     * 场景设计：
+     * 包1: Job1 Seq0 W0 -> 预留槽位，不触发 ECN（深度=0）
+     * 包2: Job1 Seq0 W1 -> 完成聚合，send_to_ps，深度=1
+     * 包3: Job2 Seq0 W0 -> 到达时深度=1 > 阈值=1，被标记 ECN
+     * 包4: Job2 Seq0 W1 -> 完成聚合，send_to_ps，深度=2，且继承 ECN
+     */
+    atp_packet_t pkts[] = {
+        make_pkt(1, 0, 0, 10, 2),
+        make_pkt(1, 0, 1, 20, 2),
+        make_pkt(2, 0, 0, 100, 2),
+        make_pkt(2, 0, 1, 200, 2),
+    };
+    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
+        switch_process(sw, &pkts[i]);
+
+    ps_process(sw);
+    print_stats(sw, 4);
+
+    free(sw->pool); free(sw->ps_queue); free(sw);
 }
 
 int main(void)
@@ -590,6 +703,8 @@ int main(void)
     test3_dynamic_reuse();
     test4_resend_recovery();
     test5_orphan_timeout();
+    test6_rescued_mechanism();
+    test7_ecn_congestion();
     printf("\n\n全部测试通过。\n");
     return 0;
 }
