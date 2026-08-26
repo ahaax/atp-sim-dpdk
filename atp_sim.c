@@ -37,8 +37,13 @@ typedef struct {
     uint32_t bitmap;          /* 该包代表哪些 Worker 的聚合（原始包为 1<<worker_id） */
     uint8_t  count;           /* 该包包含几个 Worker 的和（原始包为 1） */
     
-    
     bool ecn;             /* 新增：ECN 拥塞标记 */
+
+    uint8_t  edgeSwitchIdentifier;  /* 新增：0=第一级, 1=第二级 */
+    uint32_t bitmap0;               /* 新增：第一级 worker bitmap */
+    uint32_t bitmap1;               /* 新增：第二级 switch bitmap */
+    uint8_t  fanInDegree0;          /* 新增：第一级 fan-in */
+    uint8_t  fanInDegree1;          /* 新增：第二级 fan-in */
 
 } atp_packet_t;
 
@@ -69,6 +74,8 @@ typedef struct {
 
     uint32_t       egress_queue_depth; /* 新增：出口队列深度，用于模拟拥塞 */
     uint32_t       ecn_threshold;      /* 新增：ECN标记阈值*/
+
+    uint8_t  switch_id;             /* 新增：本 Switch 在第二级中的身份标识 */
 } atp_switch_t;
 
 #define PS_BUF_MAX 1024
@@ -120,7 +127,7 @@ atp_switch_t 结构体用于管理和跟踪与 ATP（异步传输协议）相关
 跟踪控制数据流
 包括池的指针、池的大小、数据包队列及其相关的状态信息，如已消费、回退和完成的计数。
 */
-atp_switch_t* switch_create(uint32_t pool_size)
+atp_switch_t* switch_create_with_id(uint32_t pool_size, uint8_t switch_id)
 {
     atp_switch_t *sw = calloc(1, sizeof(atp_switch_t));
     if (!sw) {
@@ -150,7 +157,13 @@ atp_switch_t* switch_create(uint32_t pool_size)
     sw->egress_queue_depth = 0;
     sw->ecn_threshold = 1; /* 默认的阈值, 测试中可覆盖 */
 
+    sw->switch_id = switch_id;
     return sw;
+}
+
+atp_switch_t* switch_create(uint32_t pool_size)
+{
+    return switch_create_with_id(pool_size, 0);
 }
 
 static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
@@ -180,14 +193,23 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
 {
     check_and_mark_ecn(sw, pkt); /* 新增：检查出口队列深度，标记 ECN */
 
+    /* 新增：第二级 Switch 直接转发重传包，不尝试聚合（论文 §3.7 / §A.1） */
+    if (pkt->edgeSwitchIdentifier == 1) {
+        printf("  [Switch] L2 重传直发PS: Job%d Seq%d\n", pkt->job_id, pkt->seq);
+        send_to_ps(sw, pkt);
+        return;
+    }
+    
     uint16_t idx = hash_idx(pkt->job_id, pkt->seq, sw->pool_size);
     agg_slot_t *slot = &sw->pool[idx];
 
+    uint32_t sender_bit = pkt->bitmap0;  /* 重传解救只发生在第一级 */
+
     /* 聚合器存在且匹配：合并并强制释放 */
     if (slot->job_id == pkt->job_id && slot->seq == pkt->seq) {
-        if (!(slot->bitmap & (1u << pkt->worker_id))) {
+        if (!(slot->bitmap & sender_bit)) {
             slot->sum += pkt->data;
-            slot->bitmap |= (1u << pkt->worker_id);
+            slot->bitmap |= sender_bit;
             slot->count++;
 
             slot->ecn |= pkt->ecn; /* 合并，累积 ECN 状态 */
@@ -208,10 +230,23 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
             .from_switch = true,
             .bitmap = slot->bitmap,
             .count = slot->count,
-            .ecn = slot->ecn  /* 新增：携带累积的 ECN 状态 */
+            .ecn = slot->ecn,  /* 新增：携带累积的 ECN 状态 */
+            /* 新增：多级聚合字段透传 */
+            .edgeSwitchIdentifier = pkt->edgeSwitchIdentifier,
+            .bitmap0 = pkt->bitmap0,
+            .bitmap1 = pkt->bitmap1,
+            .fanInDegree0 = pkt->fanInDegree0,
+            .fanInDegree1 = pkt->fanInDegree1
         };
+
+        if (pkt->edgeSwitchIdentifier == 0) {
+            result.edgeSwitchIdentifier = 1;
+            result.bitmap1 = (1u << sw->switch_id);
+        }
         /* 强制发 PS 并释放槽位 */
         send_to_ps(sw, &result);
+        
+
         memset(slot, 0, sizeof(*slot));
         sw->completed++;
         
@@ -241,6 +276,10 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 {
 
     sw->global_time++;  /* 全局时钟推进 */
+
+    /* 新增：根据 edgeSwitchIdentifier 选择当前层级的 sender_bit 和 fanInDegree */
+    uint32_t sender_bit = (pkt->edgeSwitchIdentifier == 0) ? pkt->bitmap0 : pkt->bitmap1;
+    uint8_t  cur_fanin  = (pkt->edgeSwitchIdentifier == 0) ? pkt->fanInDegree0 : pkt->fanInDegree1;
     
     check_and_mark_ecn(sw, pkt); /* 新增：检查出口队列是否堵塞 */
 
@@ -269,10 +308,44 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->job_id = pkt->job_id;
         slot->seq = pkt->seq;
         slot->sum = pkt->data;
-        slot->bitmap = pkt->bitmap; //(1u << pkt->worker_id);//1U 是一个无符号整数常量，表示值为 1 的无符号整型。它通常用于需要确保数值为非负的场景
+        slot->bitmap = sender_bit; //(1u << pkt->worker_id);//1U 是一个无符号整数常量，表示值为 1 的无符号整型。它通常用于需要确保数值为非负的场景
         slot->ecn = pkt->ecn; /* 新增：继承包的 ECN 状态 */
-        slot->count = 1;
+        slot->count = pkt->count;  /* 新增：继承包的 count，通常为1 */
         slot->timestamp = sw->global_time;
+
+        /* ===== 新增：预留后即满足 fan-in，直接完成（L2 单输入/多输入首包场景） ===== */
+        if (slot->count >= cur_fanin) {
+            uint8_t  out_id = pkt->edgeSwitchIdentifier;
+            uint32_t out_bitmap1 = pkt->bitmap1;
+            if (pkt->edgeSwitchIdentifier == 0) {
+                out_id = 1;
+                out_bitmap1 = (1u << sw->switch_id);
+            }
+
+            atp_packet_t result = {
+                .job_id = pkt->job_id, .seq = pkt->seq, .worker_id = 0xFF,
+                .data = slot->sum, .fan_in = pkt->fan_in,
+                .collision = false, .from_switch = true,
+                .bitmap = slot->bitmap, .count = slot->count, .ecn = slot->ecn,
+                .edgeSwitchIdentifier = out_id,
+                .bitmap0 = pkt->bitmap0, .bitmap1 = out_bitmap1,
+                .fanInDegree0 = pkt->fanInDegree0, .fanInDegree1 = pkt->fanInDegree1
+            };
+            send_to_ps(sw, &result);
+
+            if (pkt->edgeSwitchIdentifier == 0)
+                printf("  [Switch] 槽位%2d 完成(L1): Job%d Seq%d -> 值=%d 发往L2 (ecn=%d)\n",
+                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
+            else
+                printf("  [Switch] 槽位%2d 完成(L2): Job%d Seq%d -> 值=%d 发往PS (ecn=%d)\n",
+                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
+
+            memset(slot, 0, sizeof(*slot));
+            sw->completed++;
+            return;
+        }
+
+
 
         sw->consumed++;
         printf("  [Switch] 槽位%2d 预留    : Job%d Seq%d Worker%d (data=%d)\n",
@@ -282,7 +355,7 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
     /* ---- 路径 B：槽位是自己的 -> 累加 ---- */
     if (slot->job_id == pkt->job_id && slot->seq == pkt->seq) {
-        if (slot->bitmap & (1u << pkt->worker_id)) {
+        if (slot->bitmap & sender_bit) {  /* 修复 B：用 sender_bit 判断是否重复贡献 */
             printf("  [Switch] 槽位%2d 重复    : Job%d Seq%d Worker%d -> 丢弃\n",
                    idx, pkt->job_id, pkt->seq, pkt->worker_id);
             sw->consumed++;
@@ -290,15 +363,22 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         }
 
         slot->sum += pkt->data;
-        slot->bitmap |= (1u << pkt->worker_id);  //设为1，表示该worker已经贡献过数据
-        slot->count++;
+        slot->bitmap |= sender_bit;  //设为1，表示该worker已经贡献过数据
+        slot->count += pkt->count;  /* 修复 B：累积 count */
         slot->ecn |= pkt->ecn; /* 新增：累积 ECN 状态 */
         slot->timestamp = sw->global_time;
 
-        if (slot->count >= pkt->fan_in) {
+        if (slot->count >= cur_fanin) {
             /*
              * 修复 B：正常聚合完成时，结果包携带完整 bitmap 和 count。
              */
+
+            uint8_t  out_id = pkt->edgeSwitchIdentifier;
+            uint32_t out_bitmap1 = pkt->bitmap1;
+            if (pkt->edgeSwitchIdentifier == 0) {
+                out_id = 1;
+                out_bitmap1 = (1u << sw->switch_id);
+            }
             atp_packet_t result = {
                 .job_id = pkt->job_id,
                 .seq = pkt->seq,
@@ -310,12 +390,29 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
                 .from_switch = true,
                 .bitmap = slot->bitmap,
                 .count = slot->count,
-                .ecn = slot->ecn  /* 新增：携带累积的 ECN 状态 */
+                .ecn = slot->ecn,  /* 新增：携带累积的 ECN 状态 */
+
+                /* 新增：多级聚合字段透传 */
+                .edgeSwitchIdentifier = out_id,
+                .bitmap0 = pkt->bitmap0,
+                .bitmap1 = out_bitmap1,
+                .fanInDegree0 = pkt->fanInDegree0,
+                .fanInDegree1 = pkt->fanInDegree1
             };
             send_to_ps(sw, &result);
 
-            printf("  [Switch] 槽位%2d 完成    : Job%d Seq%d -> 值=%d (发往PS) (ECN=%d)\n",
-                   idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
+
+            if (pkt->edgeSwitchIdentifier == 0) {
+                printf("  [Switch] 槽位%2d 完成(L1): Job%d Seq%d -> 值=%d 发往L2 (ecn=%d)\n",
+                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
+            } else {
+                printf("  [Switch] 槽位%2d 完成(L2): Job%d Seq%d -> 值=%d 发往PS (ecn=%d)\n",
+                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
+            }
+
+            
+            // printf("  [Switch] 槽位%2d 完成    : Job%d Seq%d -> 值=%d (发往PS) (ECN=%d)\n",
+            //        idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
 
             memset(slot, 0, sizeof(*slot)); /* 释放槽位 */
             sw->completed++;
@@ -379,6 +476,11 @@ void ps_process(atp_switch_t *sw)
 
     for (uint32_t i = 0; i < sw->ps_tail; i++) {
         atp_packet_t *pkt = &sw->ps_queue[i];
+
+        /* 新增：包已到达 PS，从交换机出口队列出队 */
+        if (sw->egress_queue_depth > 0)
+            sw->egress_queue_depth--;
+
         ps_buffer_t *entry = NULL;
 
         for (uint32_t j = 0; j < buf_cnt; j++) {
@@ -435,15 +537,16 @@ void ps_process(atp_switch_t *sw)
         entry->bitmap |= pkt->bitmap;
         entry->count += pkt->count;  /* 修复 B：累计 count */
 
-        /* 检查是否收齐：用 bitmap 的 popcount 判断（比 count 更可靠） */
+        /* 检查是否收齐：用 bitmap 的 popcount【统计收到了多少个不同的worker的数据】
+         判断（比 count 更可靠） */
         
         uint32_t b = entry->bitmap;
         uint8_t popcnt = 0;
         while (b) { popcnt++; b &= b - 1; }  /* 计算 popcount */
 
-        if (popcnt >= entry->fan_in && !entry->done) {
-            printf("  [PS] 聚合完成: Job%d Seq%d = %d (PS端累加完成, bitmap=%u)\n",
-                   entry->job_id, entry->seq, entry->sum, entry->bitmap);
+        if ((popcnt >= entry->fan_in || entry->count >= entry->fan_in) && !entry->done) {
+            printf("  [PS] 聚合完成: Job%d Seq%d = %d (PS端累加完成, bitmap=%u, count=%d)\n",
+                   entry->job_id, entry->seq, entry->sum, entry->bitmap, entry->count);
             entry->done = true;
         }
     }
@@ -488,7 +591,13 @@ static atp_packet_t make_pkt(uint32_t job, uint16_t seq, uint8_t wid, int val, u
         .collision = false, .from_switch = false, .resend = false,
         .bitmap = (1u << wid), /* 原始包只代表自己这一个 Worker */
         .count = 1,
-        .ecn = false  /* 默认无 ECN */
+        .ecn = false,  /* 默认无 ECN */
+
+        .edgeSwitchIdentifier = 0,
+        .bitmap0 = (1u << wid),
+        .bitmap1 = 0,
+        .fanInDegree0 = fan_in,
+        .fanInDegree1 = 1
     };
 }
 
@@ -663,37 +772,121 @@ void test6_rescued_mechanism(void)
 
 
 /* ============================================================
- *  新增 Test 7：ECN 拥塞控制
+ *  新增 Test 7：ECN 拥塞控制 + 出口队列出队验证
  * ============================================================ */
 void test7_ecn_congestion(void)
 {
     printf("\n\n########################################\n");
-    printf("TEST 7: ECN 拥塞控制（出口队列深度超阈值标记 ECN）\n");
+    printf("TEST 7: ECN 拥塞控制（出口队列深度超阈值标记 ECN）+ 出口队列出队验证\n");
     printf("########################################\n");
 
-    atp_switch_t *sw = switch_create(2);
-    sw->ecn_threshold = 1; /* 低阈值，便于触发拥塞标记 */
-
-    /* 
-     * 场景设计：
-     * 包1: Job1 Seq0 W0 -> 预留槽位，不触发 ECN（深度=0）
-     * 包2: Job1 Seq0 W1 -> 完成聚合，send_to_ps，深度=1
-     * 包3: Job2 Seq0 W0 -> 到达时深度=1 > 阈值=1，被标记 ECN
-     * 包4: Job2 Seq0 W1 -> 完成聚合，send_to_ps，深度=2，且继承 ECN
+    atp_switch_t *sw = switch_create(4);  /* Pool 充足，排除冲突干扰 */
+    sw->ecn_threshold = 0;                /* 关键：阈值设为 0，任何非空队列即标记拥塞 */
+    
+    /*
+     * 场景设计（4 个包，2 个 Job，每个 Job 2 个 Worker）：
+     *
+     * 包1: Job1 Seq0 W0 -> 预留槽位，不发 PS。到达时 depth=0，ECN=0。
+     * 包2: Job1 Seq0 W1 -> 完成聚合，send_to_ps，depth 变为 1。到达时 depth=0，ECN=0。
+     *
+     * 包3: Job2 Seq0 W0 -> 到达时 depth=1 > threshold(0)，被标记 ECN=1；预留槽位。
+     * 包4: Job2 Seq0 W1 -> 到达时 depth=1 > threshold(0)，被标记 ECN=1；完成聚合，
+     *      send_to_ps，depth 变为 2。聚合器继承 ECN=1。
+     *
+     * 预期结果：
+     *   - Job1 结果包：ECN=0（未经历拥塞）
+     *   - Job2 结果包：ECN=1（经历拥塞，且聚合器 OR 了 ECN）
      */
-    atp_packet_t pkts[] = {
-        make_pkt(1, 0, 0, 10, 2),
-        make_pkt(1, 0, 1, 20, 2),
-        make_pkt(2, 0, 0, 100, 2),
-        make_pkt(2, 0, 1, 200, 2),
-    };
-    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-        switch_process(sw, &pkts[i]);
+    // atp_packet_t pkts[] = {
+    //     make_pkt(1, 0, 0, 10, 2),   /* Job1 W0 */
+    //     make_pkt(1, 0, 1, 20, 2),   /* Job1 W1 -> 完成，发 PS，depth=1 */
+    //     make_pkt(2, 0, 0, 100, 2),  /* Job2 W0 -> depth=1>0，ECN=1 */
+    //     make_pkt(2, 0, 1, 200, 2),  /* Job2 W1 -> depth=1>0，ECN=1，聚合结果 ECN=1 */
+    // };
+    // for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
+    //     switch_process(sw, &pkts[i]);
+
+
+    /* ========== 阶段 1：Job1 的两个 Worker 包 ========== */
+    atp_packet_t job1_w0 = make_pkt(1, 0, 0, 10, 2);
+    atp_packet_t job1_w1 = make_pkt(1, 0, 1, 20, 2);
+
+    switch_process(sw, &job1_w0);  /* 预留，不发 PS */
+    switch_process(sw, &job1_w1);  /* 完成聚合 -> send_to_ps，depth=1 */
+
+    printf("\n  --- 阶段 1 结束：Switch 出口队列深度=%u ---\n", sw->egress_queue_depth);
+
+    /* ========== 阶段 2：PS 取走包，队列清空 ========== */
+    ps_process(sw);
+    printf("  --- 阶段 2 结束：PS 处理完成，队列深度=%u ---\n", sw->egress_queue_depth);
+
+    /* ========== 阶段 3：Job2 的新包到达（此时队列应为空） ========== */
+    atp_packet_t job2_w0 = make_pkt(2, 0, 0, 100, 2);
+    atp_packet_t job2_w1 = make_pkt(2, 0, 1, 200, 2);
+
+    switch_process(sw, &job2_w0);  /* 预期：depth=0，ECN=0 */
+    switch_process(sw, &job2_w1);  /* 预期：depth=0，ECN=0 */
+
+    printf("\n  --- 阶段 3 结束：Job2 包处理完毕 ---\n");
+
+    /* ========== 阶段 4：PS 处理剩余包 ========== */
 
     ps_process(sw);
     print_stats(sw, 4);
 
     free(sw->pool); free(sw->ps_queue); free(sw);
+}
+
+void test8_inter_rack(void)
+{
+    printf("\n\n########################################\n");
+    printf("TEST 8: 多级聚合 Inter-rack (L1 Worker-ToR + L2 PS-ToR)\n");
+    printf("########################################\n");
+
+    /* 创建两级 Switch */
+    atp_switch_t *sw0 = switch_create_with_id(4, 0);  /* L1: Worker-ToR */
+    atp_switch_t *sw1 = switch_create_with_id(4, 1);  /* L2: PS-ToR   */
+
+    /* Job1: 2 workers 都在 SW0 机架；第二级只需聚合 SW0 这一个流 */
+    atp_packet_t w0 = make_pkt(1, 0, 0, 10, 2);
+    w0.fanInDegree0 = 2;   /* L1 需要 2 个 Worker */
+    w0.fanInDegree1 = 1;   /* L2 只需要 SW0 一个部分流 */
+
+    atp_packet_t w1 = make_pkt(1, 0, 1, 20, 2);
+    w1.fanInDegree0 = 2;
+    w1.fanInDegree1 = 1;
+
+    /* Stage 1: L1 处理 */
+    switch_process(sw0, &w0);
+    switch_process(sw0, &w1);
+
+    /* Stage 2: 手动串联 L1 输出到 L2 */
+    printf("\n  --- L1 处理完成，分拣输出 ---\n");
+    for (uint32_t i = 0; i < sw0->ps_tail; i++) {
+        atp_packet_t *p = &sw0->ps_queue[i];
+
+        if (p->from_switch && p->edgeSwitchIdentifier == 1) {
+            /* L1 聚合结果：升级 edgeSwitchIdentifier 后送 L2 */
+            /* bitmap1 已在 L1 完成时设置为 (1u << sw0->switch_id) */
+            switch_process(sw1, p);
+        } else {
+            /* 冲突回退包：直接到 PS（拷贝到 sw1 队列统一处理） */
+            if (sw1->ps_tail < sw1->ps_cap) {
+                sw1->ps_queue[sw1->ps_tail++] = *p;
+            }
+        }
+    }
+
+    /* Stage 3: PS 处理 L2 输出 + L1 fallback */
+    ps_process(sw1);
+
+    printf("\n========== L1 统计 ==========\n");
+    printf("L1 完成聚合: %lu, 回退: %lu\n", sw0->completed, sw0->fallback);
+    printf("\n========== L2 统计 ==========\n");
+    printf("L2 完成聚合: %lu, 回退: %lu\n", sw1->completed, sw1->fallback);
+
+    free(sw0->pool); free(sw0->ps_queue); free(sw0);
+    free(sw1->pool); free(sw1->ps_queue); free(sw1);
 }
 
 int main(void)
@@ -705,6 +898,7 @@ int main(void)
     test5_orphan_timeout();
     test6_rescued_mechanism();
     test7_ecn_congestion();
+    test8_inter_rack();
     printf("\n\n全部测试通过。\n");
     return 0;
 }
