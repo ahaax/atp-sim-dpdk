@@ -313,8 +313,13 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->count = pkt->count;  /* 新增：继承包的 count，通常为1 */
         slot->timestamp = sw->global_time;
 
+        /* 用 bitmap popcount 判断完成，兼容多级聚合 */
+        uint32_t b = slot->bitmap;
+        uint8_t popcnt = 0;
+        while (b) { popcnt++; b &= b - 1; }
         /* ===== 新增：预留后即满足 fan-in，直接完成（L2 单输入/多输入首包场景） ===== */
-        if (slot->count >= cur_fanin) {
+        
+        if (popcnt >= cur_fanin && pkt->edgeSwitchIdentifier == 0) {
             uint8_t  out_id = pkt->edgeSwitchIdentifier;
             uint32_t out_bitmap1 = pkt->bitmap1;
             if (pkt->edgeSwitchIdentifier == 0) {
@@ -342,6 +347,8 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
             memset(slot, 0, sizeof(*slot));
             sw->completed++;
+            printf("  [Switch] 槽位%2d 预留    : Job%d Seq%d Worker%d (data=%d)\n",
+               idx, pkt->job_id, pkt->seq, pkt->worker_id, pkt->data);
             return;
         }
 
@@ -368,7 +375,16 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->ecn |= pkt->ecn; /* 新增：累积 ECN 状态 */
         slot->timestamp = sw->global_time;
 
-        if (slot->count >= cur_fanin) {
+
+        /* 用 bitmap popcount 判断完成，兼容多级聚合 */
+        uint32_t b = slot->bitmap;
+        uint8_t popcnt = 0;
+        while (b) { popcnt++; b &= b - 1; }
+
+        /* 修复：L2 包（edgeSwitchIdentifier==1）禁止预留即完成，
+         * 必须等待至少两个 Rack 的部分和到齐（走路径 B 累加）。
+         * 这确保跨 Rack 聚合真正发生在 L2，而不是分别发给 PS。 */
+        if (popcnt >= cur_fanin ) {
             /*
              * 修复 B：正常聚合完成时，结果包携带完整 bitmap 和 count。
              */
@@ -417,8 +433,8 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
             memset(slot, 0, sizeof(*slot)); /* 释放槽位 */
             sw->completed++;
         } else {
-            printf("  [Switch] 槽位%2d 累加    : Job%d Seq%d %d/%d\n",
-                   idx, pkt->job_id, pkt->seq, slot->count, pkt->fan_in);
+            printf("  [Switch] 槽位%2d 累加    : Job%d Seq%d %d/%d (bitmap=%u)\n",
+                   idx, pkt->job_id, pkt->seq, slot->count, cur_fanin, slot->bitmap);
             sw->consumed++;
         }
         return;
@@ -840,53 +856,88 @@ void test7_ecn_congestion(void)
 void test8_inter_rack(void)
 {
     printf("\n\n########################################\n");
-    printf("TEST 8: 多级聚合 Inter-rack (L1 Worker-ToR + L2 PS-ToR)\n");
+    printf("TEST 8: 多级聚合 Inter-rack (2 L1 + 1 L2，验证跨机架等待聚合)\n");
     printf("########################################\n");
 
-    /* 创建两级 Switch */
-    atp_switch_t *sw0 = switch_create_with_id(4, 0);  /* L1: Worker-ToR */
-    atp_switch_t *sw1 = switch_create_with_id(4, 1);  /* L2: PS-ToR   */
+    /* 拓扑：2 个 Worker 机架 + 1 个 PS 机架 */
+    atp_switch_t *sw0 = switch_create_with_id(4, 0);  /* L1: Rack A */
+    atp_switch_t *sw1 = switch_create_with_id(4, 1);  /* L1: Rack B */
+    atp_switch_t *sw2 = switch_create_with_id(4, 2);  /* L2: PS-ToR */
 
-    /* Job1: 2 workers 都在 SW0 机架；第二级只需聚合 SW0 这一个流 */
-    atp_packet_t w0 = make_pkt(1, 0, 0, 10, 2);
-    w0.fanInDegree0 = 2;   /* L1 需要 2 个 Worker */
-    w0.fanInDegree1 = 1;   /* L2 只需要 SW0 一个部分流 */
+    /* Job1: 4 workers，跨 2 个机架，每个机架 2 人 */
+    /* Rack A: Worker 0, 1 */
+    atp_packet_t w0 = make_pkt(1, 0, 0, 10, 4);
+    w0.fanInDegree0 = 2;
+    w0.fanInDegree1 = 2;
 
-    atp_packet_t w1 = make_pkt(1, 0, 1, 20, 2);
+    atp_packet_t w1 = make_pkt(1, 0, 1, 20, 4);
     w1.fanInDegree0 = 2;
-    w1.fanInDegree1 = 1;
+    w1.fanInDegree1 = 2;
+
+    /* Rack B: Worker 2, 3 */
+    atp_packet_t w2 = make_pkt(1, 0, 2, 30, 4);
+    w2.fanInDegree0 = 2;
+    w2.fanInDegree1 = 2;
+
+    atp_packet_t w3 = make_pkt(1, 0, 3, 40, 4);
+    w3.fanInDegree0 = 2;
+    w3.fanInDegree1 = 2;
 
     /* Stage 1: L1 处理 */
+    printf("  --- Stage 1: SW0(L1) 处理 Rack A ---\n");
     switch_process(sw0, &w0);
     switch_process(sw0, &w1);
 
-    /* Stage 2: 手动串联 L1 输出到 L2 */
-    printf("\n  --- L1 处理完成，分拣输出 ---\n");
+    printf("\n  --- Stage 1: SW1(L1) 处理 Rack B ---\n");
+    switch_process(sw1, &w2);
+    switch_process(sw1, &w3);
+
+    /* Stage 2: 串联 L1 输出到 L2 */
+    printf("\n  --- Stage 2: 将 L1 聚合结果送 L2 ---\n");
+    
+    /* 先送 SW0 的部分和（此时 L2 应预留等待） */
     for (uint32_t i = 0; i < sw0->ps_tail; i++) {
         atp_packet_t *p = &sw0->ps_queue[i];
-
         if (p->from_switch && p->edgeSwitchIdentifier == 1) {
-            /* L1 聚合结果：升级 edgeSwitchIdentifier 后送 L2 */
-            /* bitmap1 已在 L1 完成时设置为 (1u << sw0->switch_id) */
-            switch_process(sw1, p);
-        } else {
-            /* 冲突回退包：直接到 PS（拷贝到 sw1 队列统一处理） */
-            if (sw1->ps_tail < sw1->ps_cap) {
-                sw1->ps_queue[sw1->ps_tail++] = *p;
-            }
+            printf("  [Relay] SW0->SW2: Job%d Seq%d 部分和=%d count=%d bitmap1=%u\n",
+                   p->job_id, p->seq, p->data, p->count, p->bitmap1);
+            switch_process(sw2, p);
         }
     }
 
-    /* Stage 3: PS 处理 L2 输出 + L1 fallback */
-    ps_process(sw1);
+    /* 再送 SW1 的部分和（此时 L2 应收齐并完成） */
+    for (uint32_t i = 0; i < sw1->ps_tail; i++) {
+        atp_packet_t *p = &sw1->ps_queue[i];
+        if (p->from_switch && p->edgeSwitchIdentifier == 1) {
+            printf("  [Relay] SW1->SW2: Job%d Seq%d 部分和=%d count=%d bitmap1=%u\n",
+                   p->job_id, p->seq, p->data, p->count, p->bitmap1);
+            switch_process(sw2, p);
+        }
+    }
 
-    printf("\n========== L1 统计 ==========\n");
-    printf("L1 完成聚合: %lu, 回退: %lu\n", sw0->completed, sw0->fallback);
-    printf("\n========== L2 统计 ==========\n");
-    printf("L2 完成聚合: %lu, 回退: %lu\n", sw1->completed, sw1->fallback);
+    /* Stage 2.5: 验证 L2 重传直接透传（§3.7） */
+    printf("\n  --- Stage 2.5: 模拟重传包到达 L2，验证直接透传 ---\n");
+    atp_packet_t resend_l2 = make_pkt(1, 0, 0, 10, 4);
+    resend_l2.resend = true;
+    resend_l2.edgeSwitchIdentifier = 1;
+    resend_l2.fanInDegree0 = 2;
+    resend_l2.fanInDegree1 = 2;
+    resend_l2.count = 2;  /* 模拟 L1 部分和 */
+    switch_process(sw2, &resend_l2);
+
+    /* Stage 3: PS 处理 */
+    ps_process(sw2);
+
+    printf("\n========== L1(SW0) 统计 ==========\n");
+    printf("完成聚合: %lu, 回退: %lu\n", sw0->completed, sw0->fallback);
+    printf("========== L1(SW1) 统计 ==========\n");
+    printf("完成聚合: %lu, 回退: %lu\n", sw1->completed, sw1->fallback);
+    printf("========== L2(SW2) 统计 ==========\n");
+    printf("完成聚合: %lu, 回退: %lu\n", sw2->completed, sw2->fallback);
 
     free(sw0->pool); free(sw0->ps_queue); free(sw0);
     free(sw1->pool); free(sw1->ps_queue); free(sw1);
+    free(sw2->pool); free(sw2->ps_queue); free(sw2);
 }
 
 int main(void)
