@@ -58,6 +58,12 @@ typedef struct {
     bool    ecn;             /* 新增：聚合器累积的ECN状态 */
 } agg_slot_t;
 
+/* ===== S2 新增：本地溢出环（On-Host Closure） ===== */
+typedef struct {
+    atp_packet_t *ring;
+    uint32_t head, tail, cap, count;
+} overflow_ring_t;
+
 typedef struct {
     agg_slot_t   *pool;
     uint32_t      pool_size;
@@ -76,6 +82,9 @@ typedef struct {
     uint32_t       ecn_threshold;      /* 新增：ECN标记阈值*/
 
     uint8_t  switch_id;             /* 新增：本 Switch 在第二级中的身份标识 */
+
+    /* S2：本地溢出环 */
+    overflow_ring_t ovf_ring;
 } atp_switch_t;
 
 #define PS_BUF_MAX 1024
@@ -157,6 +166,17 @@ atp_switch_t* switch_create_with_id(uint32_t pool_size, uint8_t switch_id)
     sw->egress_queue_depth = 0;
     sw->ecn_threshold = 1; /* 默认的阈值, 测试中可覆盖 */
 
+    /* S2：溢出环初始化 */
+    sw->ovf_ring.cap = 64;//环的大小确定为64吗❓
+    sw->ovf_ring.ring = calloc(sw->ovf_ring.cap, sizeof(atp_packet_t));
+    if (!sw->ovf_ring.ring) {
+        fprintf(stderr, "[Error] switch_create: calloc(ovf_ring) failed\n");
+        free(sw->ps_queue); free(sw->pool); free(sw);
+        return NULL;
+    }
+    sw->ovf_ring.head = sw->ovf_ring.tail = sw->ovf_ring.count = 0;
+
+
     sw->switch_id = switch_id;
     return sw;
 }
@@ -176,11 +196,105 @@ static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
     sw->egress_queue_depth++; /* 模拟包进入出口队列，深度增加 */
 }
 
+/* S2：冲突包进入本地溢出环；环满则挤出最老包直发 PS（背压泄洪） */
+static void ovf_push(atp_switch_t *sw, atp_packet_t *pkt)
+{
+    overflow_ring_t *r = &sw->ovf_ring;
+    if (r->count >= r->cap) {
+        atp_packet_t old = r->ring[r->head];
+        r->head = (r->head + 1) % r->cap;
+        r->count--;
+        send_to_ps(sw, &old);
+        sw->fallback++;
+        printf("  [Switch] 溢出环满，挤出旧包 Job%dSeq%d 直发 PS\n",
+               old.job_id, old.seq);
+    }
+    r->ring[r->tail] = *pkt;
+    r->tail = (r->tail + 1) % r->cap;
+    r->count++;
+}
+
 /* 新增：根据出口队列深度标记 ECN */
 static inline void check_and_mark_ecn(atp_switch_t *sw, atp_packet_t *pkt)
 {
     if (sw->egress_queue_depth > sw->ecn_threshold) {
         pkt->ecn = true;
+    }
+}
+
+/* S2：槽位释放后，尝试把溢出环中的包重新注入聚合器池 */
+static void slot_flush(atp_switch_t *sw)
+{
+    while (sw->ovf_ring.count > 0) {
+        atp_packet_t *front = &sw->ovf_ring.ring[sw->ovf_ring.head];
+        uint16_t idx = hash_idx(front->job_id, front->seq, sw->pool_size);
+        agg_slot_t *slot = &sw->pool[idx]; 
+        uint32_t sender_bit = (front->edgeSwitchIdentifier == 0) 
+                              ? front->bitmap0 : front->bitmap1;
+        bool progressed = false;  //有没有真的把ring中的packet送进slot中
+
+        /* 路径 A：槽位空闲 -> 预留 */
+        if (slot->job_id == 0 && !is_rescued(sw, front->job_id, front->seq)) {
+            slot->job_id = front->job_id;
+            slot->seq = front->seq;
+            slot->sum = front->data;
+            slot->bitmap = sender_bit;
+            slot->count = front->count;
+            slot->timestamp = sw->global_time;
+            progressed = true;
+        }
+        /* 路径 B：同 Job/Seq -> 累加（去重） */
+        else if (slot->job_id == front->job_id && slot->seq == front->seq) {
+            if (!(slot->bitmap & sender_bit)) {
+                slot->sum += front->data;
+                slot->bitmap |= sender_bit;
+                slot->count += front->count;
+                slot->timestamp = sw->global_time;
+                progressed = true;
+            } else {
+                progressed = true;   /* 重复包，丢弃 */
+                sw->consumed++;
+            }
+        }
+
+        if (!progressed) break;   /* 仍冲突，停止 flush */
+
+        /* 从环中弹出 */
+        sw->ovf_ring.head = (sw->ovf_ring.head + 1) % sw->ovf_ring.cap;
+        sw->ovf_ring.count--;
+
+        /* 检查是否已完成聚合 */
+        uint32_t b = slot->bitmap;
+        uint8_t popcnt = 0;
+        while (b) { popcnt++; b &= b - 1; }//位图运算，每次删掉一个1
+        uint8_t need = (front->edgeSwitchIdentifier == 0)
+                       ? front->fanInDegree0 : front->fanInDegree1;
+
+        if (popcnt >= need) {
+            /* 聚合完成，发 PS，槽位再次释放 -> 继续尝试下一个 */
+            atp_packet_t result = {
+                .job_id = front->job_id, .seq = front->seq,
+                .worker_id = 0xFF, .data = slot->sum,
+                .fan_in = front->fan_in, .collision = false,
+                .from_switch = true, .bitmap = slot->bitmap,
+                .count = slot->count, .ecn = slot->ecn,
+                .edgeSwitchIdentifier = 1,
+                .bitmap0 = front->bitmap0,
+                .bitmap1 = (1u << sw->switch_id),
+                .fanInDegree0 = front->fanInDegree0,
+                .fanInDegree1 = front->fanInDegree1
+            };
+            send_to_ps(sw, &result);
+            memset(slot, 0, sizeof(*slot));
+            sw->completed++;
+            printf("  [Switch] 溢出环重试完成 Job%dSeq%d -> PS\n",
+                   front->job_id, front->seq);
+        } else {
+            /* 槽位被占但未完成，等下一个 worker 或下次释放 */
+            printf("  [Switch] 溢出环重试预留 Job%dSeq%d (%d/%d)\n",
+                   front->job_id, front->seq, popcnt, need);
+            break;
+        }
     }
 }
 
@@ -249,7 +363,9 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
 
         memset(slot, 0, sizeof(*slot));
         sw->completed++;
-        
+
+        slot_flush(sw);   /* S2：重传解救释放槽位后，同样尝试复用 */
+
         /* 新增：标记该 <job, seq> 已被解救，后续同 Seq 包禁止预留 */
         mark_rescued(sw, pkt->job_id, pkt->seq);
         
@@ -347,6 +463,7 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
             memset(slot, 0, sizeof(*slot));
             sw->completed++;
+            slot_flush(sw);   /* S2：槽位释放，尝试排空溢出环 */
             printf("  [Switch] 槽位%2d 预留    : Job%d Seq%d Worker%d (data=%d)\n",
                idx, pkt->job_id, pkt->seq, pkt->worker_id, pkt->data);
             return;
@@ -432,6 +549,7 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
             memset(slot, 0, sizeof(*slot)); /* 释放槽位 */
             sw->completed++;
+            slot_flush(sw); /* S2: slot释放，尝试排空溢出ring */
         } else {
             printf("  [Switch] 槽位%2d 累加    : Job%d Seq%d %d/%d (bitmap=%u)\n",
                    idx, pkt->job_id, pkt->seq, slot->count, cur_fanin, slot->bitmap);
@@ -440,15 +558,16 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         return;
     }
 
-    /* ---- 路径 C：冲突 -> 尽力而为回退到 PS ---- */
+    /* ---- 路径 C：冲突 -> 本地溢出闭包(On-Host Closure)(尽力而为回退到 PS) ---- */
     pkt->collision = true;
-    send_to_ps(sw, pkt);
-    sw->fallback++;
+    ovf_push(sw, pkt);
+    // sw->fallback++;
 
-    printf("  [Switch] 槽位%2d 冲突回退: 被Job%dSeq%d占用,"
-           "Job%dSeq%dWorker%d -> 直接发PS (ECN=%d)\n",
+    printf("  [Switch] 槽位%2d 冲突入环: 被Job%dSeq%d占用,"
+           "Job%dSeq%dWorker%d -> 溢出环 (count=%u)\n",
            idx, slot->job_id, slot->seq,
-           pkt->job_id, pkt->seq, pkt->worker_id, pkt->ecn);
+           pkt->job_id, pkt->seq, pkt->worker_id, sw->ovf_ring.count);
+    return;
 }
 
 
@@ -597,6 +716,9 @@ static void reset_switch(atp_switch_t *sw)
     sw->completed = 0;
     sw->global_time = 0;
     sw->egress_queue_depth = 0;   
+
+    /* S2：重置溢出环 */
+    sw->ovf_ring.head = sw->ovf_ring.tail = sw->ovf_ring.count = 0;
 }
 
 static atp_packet_t make_pkt(uint32_t job, uint16_t seq, uint8_t wid, int val, uint8_t fan_in)
@@ -813,19 +935,11 @@ void test7_ecn_congestion(void)
      *   - Job1 结果包：ECN=0（未经历拥塞）
      *   - Job2 结果包：ECN=1（经历拥塞，且聚合器 OR 了 ECN）
      */
-    // atp_packet_t pkts[] = {
-    //     make_pkt(1, 0, 0, 10, 2),   /* Job1 W0 */
-    //     make_pkt(1, 0, 1, 20, 2),   /* Job1 W1 -> 完成，发 PS，depth=1 */
-    //     make_pkt(2, 0, 0, 100, 2),  /* Job2 W0 -> depth=1>0，ECN=1 */
-    //     make_pkt(2, 0, 1, 200, 2),  /* Job2 W1 -> depth=1>0，ECN=1，聚合结果 ECN=1 */
-    // };
-    // for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-    //     switch_process(sw, &pkts[i]);
 
 
     /* ========== 阶段 1：Job1 的两个 Worker 包 ========== */
-    atp_packet_t job1_w0 = make_pkt(1, 0, 0, 10, 2);
-    atp_packet_t job1_w1 = make_pkt(1, 0, 1, 20, 2);
+    atp_packet_t job1_w0 = make_pkt(1, 0, 0, 10, 2); /* Job1 W0 */
+    atp_packet_t job1_w1 = make_pkt(1, 0, 1, 20, 2); /* Job1 W1 -> 完成，发 PS，depth=1 */
 
     switch_process(sw, &job1_w0);  /* 预留，不发 PS */
     switch_process(sw, &job1_w1);  /* 完成聚合 -> send_to_ps，depth=1 */
@@ -837,8 +951,8 @@ void test7_ecn_congestion(void)
     printf("  --- 阶段 2 结束：PS 处理完成，队列深度=%u ---\n", sw->egress_queue_depth);
 
     /* ========== 阶段 3：Job2 的新包到达（此时队列应为空） ========== */
-    atp_packet_t job2_w0 = make_pkt(2, 0, 0, 100, 2);
-    atp_packet_t job2_w1 = make_pkt(2, 0, 1, 200, 2);
+    atp_packet_t job2_w0 = make_pkt(2, 0, 0, 100, 2);  /* Job2 W0 -> depth=1>0，ECN=1 */
+    atp_packet_t job2_w1 = make_pkt(2, 0, 1, 200, 2);  /* Job2 W1 -> depth=1>0，ECN=1，聚合结果 ECN=1 */
 
     switch_process(sw, &job2_w0);  /* 预期：depth=0，ECN=0 */
     switch_process(sw, &job2_w1);  /* 预期：depth=0，ECN=0 */
@@ -940,6 +1054,43 @@ void test8_inter_rack(void)
     free(sw2->pool); free(sw2->ps_queue); free(sw2);
 }
 
+/* ============================================================
+ *  S2 Test 9：On-Host Closure — 冲突包不外抛，PS 仍收齐正确结果
+ * ============================================================ */
+void test9_on_host_closure(void)
+{
+    printf("\n\n########################################\n");
+    printf("TEST 9: On-Host Closure\n");
+    printf("  场景：pool=1（强制冲突）。Job1 先占槽位，Job2 冲突入环；\n");
+    printf("        Job1 完成后槽位释放，Job2 从溢出环重试聚合。\n");
+    printf("  验证：PS 收到 Job1 和 Job2 的完整聚合结果，无未收齐警告。\n");
+    printf("########################################\n");
+
+    atp_switch_t *sw = switch_create(1);   /* 1 个槽位，必冲突 */
+
+    /* Job1: W0 预留槽位 */
+    atp_packet_t j1w0 = make_pkt(1, 0, 0, 10, 2);
+    switch_process(sw, &j1w0);
+
+    /* Job2: W0 冲突 -> 应进入溢出环，不直发 PS */
+    atp_packet_t j2w0 = make_pkt(2, 0, 0, 100, 2);
+    switch_process(sw, &j2w0);
+
+    /* Job1: W1 到达，完成聚合，释放槽位 -> slot_flush 触发 */
+    atp_packet_t j1w1 = make_pkt(1, 0, 1, 20, 2);
+    switch_process(sw, &j1w1);
+
+    /* Job2: W1 到达，与溢出环中已预留的 W0 累加，完成聚合 */
+    atp_packet_t j2w1 = make_pkt(2, 0, 1, 200, 2);
+    switch_process(sw, &j2w1);
+
+    ps_process(sw);
+    print_stats(sw, 4);
+
+    free(sw->ovf_ring.ring);
+    free(sw->pool); free(sw->ps_queue); free(sw);
+}
+
 int main(void)
 {
     test1_no_contention();
@@ -950,6 +1101,7 @@ int main(void)
     test6_rescued_mechanism();
     test7_ecn_congestion();
     test8_inter_rack();
+    test9_on_host_closure();
     printf("\n\n全部测试通过。\n");
     return 0;
 }
