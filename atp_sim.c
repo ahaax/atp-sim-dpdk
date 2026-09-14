@@ -5,7 +5,6 @@
 #include <string.h>
 #include <assert.h>
 
-
 /* ============================================================
  *  ATP 极简 C 仿真（修正版）
  *  编译: gcc -O2 -Wall atp_sim.c -o atp_sim
@@ -15,22 +14,12 @@
 /* 记录已经被重传解救过的 <job_id, seq>，防止后续包再次预留形成孤儿聚合器 */
 #define RESCUED_MAX 256
 
-#define PS_BUF_MAX 1024
-
-typedef struct {
-    uint32_t job_id;
-    uint16_t seq;
-    int32_t  sum;
-    uint32_t bitmap;
-    uint8_t  count;
-    uint8_t  fan_in;
-    bool     done;
-} ps_buffer_t;
-
 typedef struct {
     uint32_t job_id;
     uint16_t seq;
 } rescued_entry_t;
+
+
 
 typedef struct {
     uint32_t job_id;
@@ -67,38 +56,7 @@ typedef struct {
     uint8_t  count;
     uint64_t timestamp;       /* 新增：最后更新时间（用全局时钟计数） */
     bool    ecn;             /* 新增：聚合器累积的ECN状态 */
-    uint8_t fan_in;        /* S4 修复：存储 fan_in，供超时清理恢复，当前层级的cur_fan_in */
-    uint8_t  edgeSwitchIdentifier; /* 预留时的层级：0=L1, 1=L2 */
-    uint32_t bitmap0;             /* 原始 worker bitmap（用于 L1→L2 结果包构造） */
-    uint8_t  fanInDegree0;        /* 透传：L1 fan-in */
-    uint8_t  fanInDegree1;        /* 透传：L2 fan-in */
 } agg_slot_t;
-
-/* S2 类型保留 */
-typedef struct {
-    atp_packet_t *ring;
-    uint32_t head, tail, cap, count;
-} overflow_ring_t;
-
-/* S4 类型保留 */
-typedef enum {
-    POLICY_FULL_AGG = 0,
-    POLICY_EARLY_RELEASE,
-    POLICY_BYPASS,
-    POLICY_MAX
-} agg_policy_t;
-
-typedef struct {
-    const char *name;
-    bool   accept_new;
-    bool   allow_partial;
-    uint8_t min_release;
-    uint32_t timeout;
-    int    score;
-} policy_params_t;
-
-/*--------S4--------*/
-
 
 typedef struct {
     agg_slot_t   *pool;
@@ -118,18 +76,19 @@ typedef struct {
     uint32_t       ecn_threshold;      /* 新增：ECN标记阈值*/
 
     uint8_t  switch_id;             /* 新增：本 Switch 在第二级中的身份标识 */
-
-    /* S2：本地溢出环 */
-    overflow_ring_t ovf_ring;
-
-    /* S4：Theseus 闭环控制与统计 */
-    uint32_t      qdepth_ewma;         /* EWMA 平滑后的队列深度 */
-    uint64_t      last_switch_time;    /* 上次策略切换时刻（dwell time 用） */
-    uint64_t      dwell_time;          /* 最短驻留时间，防振荡 */
-    uint64_t      switch_count;        /* 热切换次数 */
-    uint64_t      policy_dwell[POLICY_MAX]; /* 各策略累计驻留 tick */
-    uint64_t      policy_enter_time;   /* 当前策略进入时刻 */
 } atp_switch_t;
+
+#define PS_BUF_MAX 1024
+
+typedef struct {
+    uint32_t job_id;
+    uint16_t seq;
+    int32_t  sum;
+    uint32_t bitmap;
+    uint8_t  count;
+    uint8_t  fan_in;
+    bool     done;
+} ps_buffer_t;
 
 //计算hash索引
 static inline uint16_t hash_idx(uint32_t job_id, uint16_t seq, uint32_t pool_size)
@@ -162,19 +121,6 @@ static void mark_rescued(atp_switch_t *sw, uint32_t job_id, uint16_t seq)
     sw->rescued[sw->rescued_cnt].seq = seq;
     sw->rescued_cnt++;
 }
-
-static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
-{
-    if (sw->ps_tail >= sw->ps_cap) {
-        fprintf(stderr, "PS queue overflow\n");
-        exit(1);
-    }
-    sw->ps_queue[sw->ps_tail++] = *pkt;
-    sw->egress_queue_depth++; /* 模拟包进入出口队列，深度增加 */
-}
-
-#include "atp_s2.h"
-#include "atp_s4.h"
 
 /*
 atp_switch_t 结构体用于管理和跟踪与 ATP（异步传输协议）相关的状态和数据，
@@ -211,24 +157,6 @@ atp_switch_t* switch_create_with_id(uint32_t pool_size, uint8_t switch_id)
     sw->egress_queue_depth = 0;
     sw->ecn_threshold = 1; /* 默认的阈值, 测试中可覆盖 */
 
-    /* S2：溢出环初始化 */
-    sw->ovf_ring.cap = 64;//环的大小确定为64吗❓
-    sw->ovf_ring.ring = calloc(sw->ovf_ring.cap, sizeof(atp_packet_t));
-    if (!sw->ovf_ring.ring) {
-        fprintf(stderr, "[Error] switch_create: calloc(ovf_ring) failed\n");
-        free(sw->ps_queue); free(sw->pool); free(sw);
-        return NULL;
-    }
-    sw->ovf_ring.head = sw->ovf_ring.tail = sw->ovf_ring.count = 0;
-
-    /* S4：Theseus 字段初始化 */
-    sw->qdepth_ewma = 0;
-    sw->last_switch_time = 0;
-    sw->dwell_time = 5;              /* 默认最短驻留 5 个包（可配置） */
-    sw->switch_count = 0;
-    memset(sw->policy_dwell, 0, sizeof(sw->policy_dwell));
-    sw->policy_enter_time = 0;
-
     sw->switch_id = switch_id;
     return sw;
 }
@@ -238,6 +166,15 @@ atp_switch_t* switch_create(uint32_t pool_size)
     return switch_create_with_id(pool_size, 0);
 }
 
+static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
+{
+    if (sw->ps_tail >= sw->ps_cap) {
+        fprintf(stderr, "PS queue overflow\n");
+        exit(1);
+    }
+    sw->ps_queue[sw->ps_tail++] = *pkt;
+    sw->egress_queue_depth++; /* 模拟包进入出口队列，深度增加 */
+}
 
 /* 新增：根据出口队列深度标记 ECN */
 static inline void check_and_mark_ecn(atp_switch_t *sw, atp_packet_t *pkt)
@@ -246,7 +183,6 @@ static inline void check_and_mark_ecn(atp_switch_t *sw, atp_packet_t *pkt)
         pkt->ecn = true;
     }
 }
-
 
 /* 
  * 处理重传包（论文 §3.7 核心）
@@ -313,9 +249,7 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
 
         memset(slot, 0, sizeof(*slot));
         sw->completed++;
-
-        slot_flush(sw);   /* S2：重传解救释放槽位后，同样尝试复用 */
-
+        
         /* 新增：标记该 <job, seq> 已被解救，后续同 Seq 包禁止预留 */
         mark_rescued(sw, pkt->job_id, pkt->seq);
         
@@ -329,23 +263,7 @@ static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
     send_to_ps(sw, pkt);
 }
 
-/* S4 全局变量定义（atp_s4.h 中只有 extern 声明） */
-agg_policy_t g_policy_id = POLICY_FULL_AGG;
 
-const policy_params_t POLICY_TABLE[POLICY_MAX] = {
-    [POLICY_FULL_AGG] = {
-        .name = "FULL_AGG", .accept_new = true, .allow_partial = false,
-        .min_release = 0, .timeout = 10, .score = 100
-    },
-    [POLICY_EARLY_RELEASE] = {
-        .name = "EARLY_RELEASE", .accept_new = true, .allow_partial = true,
-        .min_release = 2, .timeout = 2, .score = 50
-    },
-    [POLICY_BYPASS] = {
-        .name = "BYPASS", .accept_new = false, .allow_partial = true,
-        .min_release = 1, .timeout = 1, .score = 0
-    }
-};
 
 
 /* 
@@ -363,23 +281,6 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
     uint32_t sender_bit = (pkt->edgeSwitchIdentifier == 0) ? pkt->bitmap0 : pkt->bitmap1;
     uint8_t  cur_fanin  = (pkt->edgeSwitchIdentifier == 0) ? pkt->fanInDegree0 : pkt->fanInDegree1;
     
-    /* S4：Theseus 闭环 —— 每包评估策略（DPDK 场景下可改为每 burst） */
-    agg_policy_t new_pol = evaluate_policy(sw);
-    if (new_pol != g_policy_id) {
-        /* 结算旧策略驻留时间 */
-        sw->policy_dwell[g_policy_id] += sw->global_time - sw->policy_enter_time;
-        sw->switch_count++;
-        sw->last_switch_time = sw->global_time;
-        sw->policy_enter_time = sw->global_time;
-
-        printf("  [Switch] 策略热切换: %s -> %s (ewma=%u)\n",
-               POLICY_TABLE[g_policy_id].name,
-               POLICY_TABLE[new_pol].name,
-               sw->qdepth_ewma);
-        g_policy_id = new_pol;      /* ← O(1) 原子写，绝不清池（Delta Migration） */
-    }
-    const policy_params_t *pol = &POLICY_TABLE[g_policy_id];
-
     check_and_mark_ecn(sw, pkt); /* 新增：检查出口队列是否堵塞 */
 
     /* 如果是重传包，走专门逻辑 */
@@ -402,18 +303,7 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
                 idx, pkt->job_id, pkt->seq);
             return;
         }
-        
-        /* 、
-         * S4：策略禁止预留时，直接回退 PS（BYPASS 快速泄压）
-         * ①已被重传解救过②策略禁止预留③聚合器已满（溢出环）都直接发 PS
-         */
-        if (!pol->accept_new) {
-            send_to_ps(sw, pkt);
-            sw->fallback++;
-            printf("  [Switch] 策略 %s 禁止预留 -> 直发 PS\n", pol->name);
-            return;
-        }
-
+       
         // 正常预留
         slot->job_id = pkt->job_id;
         slot->seq = pkt->seq;
@@ -422,11 +312,7 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->ecn = pkt->ecn; /* 新增：继承包的 ECN 状态 */
         slot->count = pkt->count;  /* 新增：继承包的 count，通常为1 */
         slot->timestamp = sw->global_time;
-        slot->fan_in =cur_fanin;   /* S4 修复：存储 fan_in，供超时清理恢复 */
-        slot->edgeSwitchIdentifier = pkt->edgeSwitchIdentifier;
-        slot->bitmap0 = pkt->bitmap0;
-        slot->fanInDegree0 = pkt->fanInDegree0;
-        slot->fanInDegree1 = pkt->fanInDegree1;
+
         /* 用 bitmap popcount 判断完成，兼容多级聚合 */
         uint32_t b = slot->bitmap;
         uint8_t popcnt = 0;
@@ -461,7 +347,6 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
             memset(slot, 0, sizeof(*slot));
             sw->completed++;
-            slot_flush(sw);   /* S2：槽位释放，尝试排空溢出环 */
             printf("  [Switch] 槽位%2d 预留    : Job%d Seq%d Worker%d (data=%d)\n",
                idx, pkt->job_id, pkt->seq, pkt->worker_id, pkt->data);
             return;
@@ -491,22 +376,15 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         slot->timestamp = sw->global_time;
 
 
-        /* S4：策略驱动的释放条件(完整聚合或允许部分聚合且达到下限) */
+        /* 用 bitmap popcount 判断完成，兼容多级聚合 */
         uint32_t b = slot->bitmap;
         uint8_t popcnt = 0;
         while (b) { popcnt++; b &= b - 1; }
 
-        bool should_release = false;
-        if (popcnt >= slot->fan_in) {
-            should_release = true;                          /* 完整聚合 */
-        } else if (pol->allow_partial && popcnt >= pol->min_release) {
-            should_release = true;                          /* 部分聚合，策略允许 */
-        }
-
         /* 修复：L2 包（edgeSwitchIdentifier==1）禁止预留即完成，
          * 必须等待至少两个 Rack 的部分和到齐（走路径 B 累加）。
          * 这确保跨 Rack 聚合真正发生在 L2，而不是分别发给 PS。 */
-        if (should_release) {
+        if (popcnt >= cur_fanin ) {
             /*
              * 修复 B：正常聚合完成时，结果包携带完整 bitmap 和 count。
              */
@@ -554,7 +432,6 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
 
             memset(slot, 0, sizeof(*slot)); /* 释放槽位 */
             sw->completed++;
-            slot_flush(sw); /* S2: slot释放，尝试排空溢出ring */
         } else {
             printf("  [Switch] 槽位%2d 累加    : Job%d Seq%d %d/%d (bitmap=%u)\n",
                    idx, pkt->job_id, pkt->seq, slot->count, cur_fanin, slot->bitmap);
@@ -563,67 +440,30 @@ void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
         return;
     }
 
-    /* ---- 路径 C：冲突 -> 本地溢出闭包(On-Host Closure)(尽力而为回退到 PS) ---- */
+    /* ---- 路径 C：冲突 -> 尽力而为回退到 PS ---- */
     pkt->collision = true;
+    send_to_ps(sw, pkt);
+    sw->fallback++;
 
-    /* S4：BYPASS 策略下，异流包直接发 PS，不占用溢出环（快速泄压） */ //???❓
-    if (g_policy_id == POLICY_BYPASS) {
-        send_to_ps(sw, pkt);
-        sw->fallback++;
-        printf("  [Switch] BYPASS 冲突直发 PS\n");
-        return;
-    }
-    ovf_push(sw, pkt);
-    // sw->fallback++;
-
-    printf("  [Switch] 槽位%2d 冲突入环: 被Job%dSeq%d占用,"
-           "Job%dSeq%dWorker%d -> 溢出环 (count=%u)\n",
+    printf("  [Switch] 槽位%2d 冲突回退: 被Job%dSeq%d占用,"
+           "Job%dSeq%dWorker%d -> 直接发PS (ECN=%d)\n",
            idx, slot->job_id, slot->seq,
-           pkt->job_id, pkt->seq, pkt->worker_id, sw->ovf_ring.count);
-    return;
+           pkt->job_id, pkt->seq, pkt->worker_id, pkt->ecn);
 }
 
 
 /*
- * 超时扫描：清理孤儿聚合器（论文 §3.7 内存泄漏防护）+
- * S4/S5：超时扫描 —— timeout 读自当前策略（策略切换后下一轮自动生效） 
+ * 超时扫描：清理孤儿聚合器（论文 §3.7 内存泄漏防护）
  */
-void switch_scan_timeout(atp_switch_t *sw, uint64_t dummy)
+void switch_scan_timeout(atp_switch_t *sw, uint64_t threshold)
 {
-    const policy_params_t *pol = &POLICY_TABLE[g_policy_id];
-    (void)dummy;  /* 忽略旧 threshold 参数，改用 pol->timeout */
-
     for (uint32_t i = 0; i < sw->pool_size; i++) {
         agg_slot_t *slot = &sw->pool[i];
         if (slot->job_id != 0 &&
-            (sw->global_time - slot->timestamp) > pol->timeout) {
-
-            printf("  [Switch] 槽位%2d 超时清理(%s, to=%u): Job%d Seq%d\n",
-                   i, pol->name, pol->timeout, slot->job_id, slot->seq);
-
-            /* Delta migration：超时也不丢弃进行中的状态，物化到 PS */
-            if (slot->count > 0) {
-                uint8_t  out_id = slot->edgeSwitchIdentifier;
-                uint32_t out_bitmap1 = 0;
-                if (slot->edgeSwitchIdentifier == 0) {
-                    out_id = 1;
-                    out_bitmap1 = (1u << sw->switch_id);
-                }
-                atp_packet_t result = {
-                    .job_id = slot->job_id, .seq = slot->seq,
-                    .data = slot->sum, .bitmap = slot->bitmap,
-                    .worker_id = 0xFF,.fan_in = slot->fan_in,
-                    .collision = false,.from_switch = true,
-                    .count = slot->count, .ecn = slot->ecn,
-                    .edgeSwitchIdentifier = out_id, /* 超时清理后发往 PS */
-                    .bitmap0 = slot->bitmap0, .bitmap1 = out_bitmap1,
-                    .fanInDegree0 = slot->fanInDegree0, .fanInDegree1 = slot->fanInDegree1
-                };
-                send_to_ps(sw, &result);//❓
-            }
-
+            (sw->global_time - slot->timestamp) > threshold) {
+            printf("  [Switch] 槽位%2d 超时清理: Job%d Seq%d 孤儿聚合器强制释放\n",
+                   i, slot->job_id, slot->seq);
             memset(slot, 0, sizeof(*slot));
-            slot_flush(sw);   /* 释放后尝试复用槽位 */
         }
     }
 }
@@ -746,14 +586,6 @@ static void print_stats(atp_switch_t *sw, int total_packets)
     printf("PS 收到包数        : %u\n", sw->ps_tail);
     printf("带宽节省率         : %.1f%%\n",
            100.0 * sw->consumed / total_packets);
-
-    printf("\n========== Theseus 热切换统计 ==========\n");
-    /* 结算当前策略驻留时间 */
-    sw->policy_dwell[g_policy_id] += sw->global_time - sw->policy_enter_time;
-    printf("策略切换次数        : %lu\n", sw->switch_count);
-    for (int p = 0; p < POLICY_MAX; p++) {
-        printf("  %-18s 驻留 %lu ticks\n", POLICY_TABLE[p].name, sw->policy_dwell[p]);
-    }
 }
 
 static void reset_switch(atp_switch_t *sw)
@@ -765,15 +597,6 @@ static void reset_switch(atp_switch_t *sw)
     sw->completed = 0;
     sw->global_time = 0;
     sw->egress_queue_depth = 0;   
-
-    /* S2：重置溢出环 */
-    sw->ovf_ring.head = sw->ovf_ring.tail = sw->ovf_ring.count = 0;
-
-    /* S4：重置策略状态（累计统计 policy_dwell 不清零，保留跨实验观测） */
-    g_policy_id = POLICY_FULL_AGG;
-    sw->qdepth_ewma = 0;
-    sw->last_switch_time = 0;
-    sw->policy_enter_time = sw->global_time;
 }
 
 static atp_packet_t make_pkt(uint32_t job, uint16_t seq, uint8_t wid, int val, uint8_t fan_in)
@@ -899,7 +722,6 @@ void test5_orphan_timeout(void)
 {
     printf("\n\n########################################\n");
     printf("TEST 5: Pool=1, Worker 崩溃，展示孤儿聚合器超时清理\n");
-    printf("  注意：S4 后 timeout 由策略表决定，FULL_AGG 的 timeout=10。\n");
     printf("########################################\n");
 
     atp_switch_t *sw = switch_create(1);
@@ -910,8 +732,8 @@ void test5_orphan_timeout(void)
     switch_process(sw, &pkts[0]);
 
     printf("\n  --- 模拟时间推进，扫描超时(阈值=3)---\n");
-    sw->global_time = 15; /* 快进时间 */
-    switch_scan_timeout(sw, 0);/* 第二个参数已忽略，传 0 占位 */
+    sw->global_time = 5; /* 快进时间 */
+    switch_scan_timeout(sw, 3);
 
     /* 槽位已被清理，新 Job 可以进来 */
     atp_packet_t late = make_pkt(2, 0, 0, 999, 2);
@@ -920,7 +742,6 @@ void test5_orphan_timeout(void)
     ps_process(sw);
     print_stats(sw, 2);
 
-    free(sw->ovf_ring.ring);
     free(sw->pool); free(sw->ps_queue); free(sw);
     printf("  [Note] Job1 数据已丢失，需 Worker 重传或 PS 请求重传才能恢复\n");
     
@@ -992,11 +813,19 @@ void test7_ecn_congestion(void)
      *   - Job1 结果包：ECN=0（未经历拥塞）
      *   - Job2 结果包：ECN=1（经历拥塞，且聚合器 OR 了 ECN）
      */
+    // atp_packet_t pkts[] = {
+    //     make_pkt(1, 0, 0, 10, 2),   /* Job1 W0 */
+    //     make_pkt(1, 0, 1, 20, 2),   /* Job1 W1 -> 完成，发 PS，depth=1 */
+    //     make_pkt(2, 0, 0, 100, 2),  /* Job2 W0 -> depth=1>0，ECN=1 */
+    //     make_pkt(2, 0, 1, 200, 2),  /* Job2 W1 -> depth=1>0，ECN=1，聚合结果 ECN=1 */
+    // };
+    // for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
+    //     switch_process(sw, &pkts[i]);
 
 
     /* ========== 阶段 1：Job1 的两个 Worker 包 ========== */
-    atp_packet_t job1_w0 = make_pkt(1, 0, 0, 10, 2); /* Job1 W0 */
-    atp_packet_t job1_w1 = make_pkt(1, 0, 1, 20, 2); /* Job1 W1 -> 完成，发 PS，depth=1 */
+    atp_packet_t job1_w0 = make_pkt(1, 0, 0, 10, 2);
+    atp_packet_t job1_w1 = make_pkt(1, 0, 1, 20, 2);
 
     switch_process(sw, &job1_w0);  /* 预留，不发 PS */
     switch_process(sw, &job1_w1);  /* 完成聚合 -> send_to_ps，depth=1 */
@@ -1008,8 +837,8 @@ void test7_ecn_congestion(void)
     printf("  --- 阶段 2 结束：PS 处理完成，队列深度=%u ---\n", sw->egress_queue_depth);
 
     /* ========== 阶段 3：Job2 的新包到达（此时队列应为空） ========== */
-    atp_packet_t job2_w0 = make_pkt(2, 0, 0, 100, 2);  /* Job2 W0 -> depth=1>0，ECN=1 */
-    atp_packet_t job2_w1 = make_pkt(2, 0, 1, 200, 2);  /* Job2 W1 -> depth=1>0，ECN=1，聚合结果 ECN=1 */
+    atp_packet_t job2_w0 = make_pkt(2, 0, 0, 100, 2);
+    atp_packet_t job2_w1 = make_pkt(2, 0, 1, 200, 2);
 
     switch_process(sw, &job2_w0);  /* 预期：depth=0，ECN=0 */
     switch_process(sw, &job2_w1);  /* 预期：depth=0，ECN=0 */
@@ -1111,93 +940,6 @@ void test8_inter_rack(void)
     free(sw2->pool); free(sw2->ps_queue); free(sw2);
 }
 
-/* ============================================================
- *  S2 Test 9：On-Host Closure — 冲突包不外抛，PS 仍收齐正确结果
- * ============================================================ */
-void test9_on_host_closure(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 9: On-Host Closure\n");
-    printf("  场景：pool=1（强制冲突）。Job1 先占槽位，Job2 冲突入环；\n");
-    printf("        Job1 完成后槽位释放，Job2 从溢出环重试聚合。\n");
-    printf("  验证：PS 收到 Job1 和 Job2 的完整聚合结果，无未收齐警告。\n");
-    printf("########################################\n");
-
-    atp_switch_t *sw = switch_create(1);   /* 1 个槽位，必冲突 */
-
-    /* Job1: W0 预留槽位 */
-    atp_packet_t j1w0 = make_pkt(1, 0, 0, 10, 2);
-    switch_process(sw, &j1w0);
-
-    /* Job2: W0 冲突 -> 应进入溢出环，不直发 PS */
-    atp_packet_t j2w0 = make_pkt(2, 0, 0, 100, 2);
-    switch_process(sw, &j2w0);
-
-    /* Job1: W1 到达，完成聚合，释放槽位 -> slot_flush 触发 */
-    atp_packet_t j1w1 = make_pkt(1, 0, 1, 20, 2);
-    switch_process(sw, &j1w1);
-
-    /* Job2: W1 到达，与溢出环中已预留的 W0 累加，完成聚合 */
-    atp_packet_t j2w1 = make_pkt(2, 0, 1, 200, 2);
-    switch_process(sw, &j2w1);
-
-    ps_process(sw);
-    print_stats(sw, 4);
-
-    free(sw->ovf_ring.ring);
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-
-/* ============================================================
- *  S4 Test 11：验证 EARLY_RELEASE 的实际效果
- *  场景：pool=2（资源紧张），fan_in=4（4 Worker），2 个 Seq。
- *        拥塞注入后策略切为 EARLY_RELEASE，观察 Seq1 被拆成
- *        两次部分聚合（2+2）提前释放，而非等待 4/4。
- *  验证：
- *    - 策略切换轨迹：FULL_AGG -> EARLY_RELEASE
- *    - Seq0 完整聚合（4/4）后槽位释放
- *    - Seq1 在 EARLY_RELEASE 下分两次提前释放（2/4 + 2/4）
- *    - PS 端合并两个部分结果，最终 count=4，无未收齐警告
- * ============================================================ */
-void test11_policy_switch(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 11: 拥塞注入下的 EARLY_RELEASE 实际效果\n");
-    printf("  场景：pool=2, fan_in=4, min_release=2\n");
-    printf("        Seq0 先完整聚合；拥塞后 Seq1 被拆成 2+2 提前释放。\n");
-    printf("########################################\n");
-
-    atp_switch_t *sw = switch_create(2);   /* 仅 2 槽位，制造竞争 */
-    sw->ecn_threshold = 2;
-    sw->dwell_time = 2;                    /* 最短驻留 2 个包 */
-
-    /* 2 个 Seq，每个 4 个 Worker */
-    atp_packet_t pkts[8];
-    pkts[0] = make_pkt(1, 0, 0, 10, 4);   /* Seq0 W0 */
-    pkts[1] = make_pkt(1, 0, 1, 20, 4);   /* Seq0 W1 */
-    pkts[2] = make_pkt(1, 0, 2, 30, 4);   /* Seq0 W2 */
-    pkts[3] = make_pkt(1, 0, 3, 40, 4);   /* Seq0 W3 */
-    pkts[4] = make_pkt(1, 1, 0, 100, 4);  /* Seq1 W0 */
-    pkts[5] = make_pkt(1, 1, 1, 200, 4);  /* Seq1 W1 */
-    pkts[6] = make_pkt(1, 1, 2, 300, 4);  /* Seq1 W2 */
-    pkts[7] = make_pkt(1, 1, 3, 400, 4);  /* Seq1 W3 */
-
-    for (int i = 0; i < 8; i++) {
-        /* 在 Seq0 W2 (i=2) 后注入拥塞，EWMA 开始爬升 */
-        if (i == 2) sw->egress_queue_depth = 20;
-        /* 在 Seq1 W0 (i=4) 后缓解，观察策略是否回退 */
-        if (i == 6) sw->egress_queue_depth = 0;
-
-        switch_process(sw, &pkts[i]);
-    }
-
-    ps_process(sw);
-    print_stats(sw, 8);
-
-    free(sw->ovf_ring.ring);
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-
 int main(void)
 {
     test1_no_contention();
@@ -1208,8 +950,6 @@ int main(void)
     test6_rescued_mechanism();
     test7_ecn_congestion();
     test8_inter_rack();
-    test9_on_host_closure();
-    test11_policy_switch();
     printf("\n\n全部测试通过。\n");
     return 0;
 }
