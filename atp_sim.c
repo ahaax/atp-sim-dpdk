@@ -1,955 +1,586 @@
-#include <stdio.h>
+﻿/* 阅读约定：Worker 为训练发送端，PS 为参数服务器；所有成员集合均使用全局 Worker 位图。
+ * tick 是仿真时间单位，不是毫秒；报文字节格式由 atp_wire.c 显式编码。
+ * 本次仅添加中文注释和排版，不改变任何非注释代码标记。 */
+#include "atp_sim.h"
 #include <stdlib.h>
-#include <stdint.h>
-#include <stdbool.h>
 #include <string.h>
-#include <assert.h>
+#include <stdio.h>
+#include <inttypes.h>
+#include <limits.h>
 
-/* ============================================================
- *  ATP 极简 C 仿真（修正版）
- *  编译: gcc -O2 -Wall atp_sim.c -o atp_sim
- *  运行: ./atp_sim
- * ============================================================ */
-
-/* 记录已经被重传解救过的 <job_id, seq>，防止后续包再次预留形成孤儿聚合器 */
-#define RESCUED_MAX 256
-
-typedef struct {
-    uint32_t job_id;
-    uint16_t seq;
-} rescued_entry_t;
-
-
-
-typedef struct {
-    uint32_t job_id;
-    uint16_t seq;
-    uint8_t  worker_id;
-    int32_t  data;
-    uint8_t  fan_in;
-    bool     collision;
-    bool     from_switch;
-    bool     resend;          /* 新增：是否为重传包 */
-    /* 
-     * 修复 B 新增：交换机结果包需要携带聚合器内的 bitmap 和 count，
-     * 以便 PS 端判断这是"部分聚合"还是"完整聚合"，并做去重。
-     */
-    uint32_t bitmap;          /* 该包代表哪些 Worker 的聚合（原始包为 1<<worker_id） */
-    uint8_t  count;           /* 该包包含几个 Worker 的和（原始包为 1） */
-    
-    bool ecn;             /* 新增：ECN 拥塞标记 */
-
-    uint8_t  edgeSwitchIdentifier;  /* 新增：0=第一级, 1=第二级 */
-    uint32_t bitmap0;               /* 新增：第一级 worker bitmap */
-    uint32_t bitmap1;               /* 新增：第二级 switch bitmap */
-    uint8_t  fanInDegree0;          /* 新增：第一级 fan-in */
-    uint8_t  fanInDegree1;          /* 新增：第二级 fan-in */
-
-} atp_packet_t;
-
-/* 聚合器槽位：job_id == 0 表示空闲，不需要额外的 occupied 字段 */
-typedef struct {
-    uint32_t job_id;
-    uint16_t seq;
-    int32_t  sum;
-    uint32_t bitmap;
-    uint8_t  count;
-    uint64_t timestamp;       /* 新增：最后更新时间（用全局时钟计数） */
-    bool    ecn;             /* 新增：聚合器累积的ECN状态 */
-} agg_slot_t;
-
-typedef struct {
-    agg_slot_t   *pool;
-    uint32_t      pool_size;
-    atp_packet_t *ps_queue;
-    uint32_t      ps_tail;  // 管理或跟踪数据结构的尾部位置
-    uint32_t      ps_cap; //表示某种能力或容量的值
-    uint64_t      consumed;
-    uint64_t      fallback;
-    uint64_t      completed;
-    uint64_t      global_time;/* 新增：模拟全局时钟，每处理一个包+1 */
-    /* 新增：已解救表 */
-    rescued_entry_t rescued[RESCUED_MAX];
-    uint32_t        rescued_cnt;
-
-    uint32_t       egress_queue_depth; /* 新增：出口队列深度，用于模拟拥塞 */
-    uint32_t       ecn_threshold;      /* 新增：ECN标记阈值*/
-
-    uint8_t  switch_id;             /* 新增：本 Switch 在第二级中的身份标识 */
-} atp_switch_t;
-
-#define PS_BUF_MAX 1024
-
-typedef struct {
-    uint32_t job_id;
-    uint16_t seq;
-    int32_t  sum;
-    uint32_t bitmap;
-    uint8_t  count;
-    uint8_t  fan_in;
-    bool     done;
-} ps_buffer_t;
-
-//计算hash索引
-static inline uint16_t hash_idx(uint32_t job_id, uint16_t seq, uint32_t pool_size)
-{
-    return ((job_id * 31 + seq) % pool_size);
+/* 比较 job、iteration、tensor、seq 四个字段，判断是否为同一分片。 */
+bool atp_key_equal(atp_key a, atp_key b) {
+    return a.job==b.job && a.iteration==b.iteration && a.tensor==b.tensor && a.seq==b.seq;
+}
+/* 将分片标识映射到槽下标；capacity 为槽数，返回范围 [0, capacity)，容量为 0 时返回 0。 */
+uint32_t atp_hash(atp_key k, uint32_t capacity) {
+    /* h 为混合哈希状态；uint32 无符号回绕是计算的一部分。 */
+    uint32_t h=k.job;
+    h=(h^k.iteration)*UINT32_C(16777619);
+    h=(h^k.tensor)*UINT32_C(16777619);
+    h=(h^k.seq)*UINT32_C(16777619);
+    return capacity ? h%capacity : 0;
+}
+/* 初始化交换机并分配 capacity 个槽；expected 是默认 Worker 位图，level 只能为 1 或 2；失败返回 false。 */
+bool atp_switch_init(atp_switch *sw,uint32_t capacity,uint32_t expected,unsigned level) {
+    if(!sw || !capacity || !expected || (level!=1 && level!=2)) return false;
+    memset(sw,0,sizeof(*sw)); sw->slots=calloc(capacity,sizeof(*sw->slots));
+    if(!sw->slots) return false;
+    sw->capacity=capacity; sw->expected=expected; sw->job_members=expected;
+    sw->level=level; return true;
+}
+/* 释放槽内存并清零交换机；允许 sw 为 NULL。 */
+void atp_switch_destroy(atp_switch *sw) {
+    if(sw) { free(sw->slots); memset(sw,0,sizeof(*sw)); }
+}
+/* 查询分片是否已关闭；关闭记录（墓碑）用于阻止迟到包重新创建聚合状态。 */
+static bool is_closed(const atp_switch *sw,atp_key key) {
+    for(unsigned i=0;i<sw->closed_count;++i)
+        if(atp_key_equal(sw->closed[i],key)) return true;
+    return false;
+}
+/* 登记关闭分片；墓碑表满后停止接纳新聚合，转为旁路，避免遗忘旧分片造成重复聚合。 */
+static void close_key(atp_switch *sw, atp_key key) {
+    if(is_closed(sw, key)) return;
+    if(sw->closed_count < ATP_FRAGMENTS) sw->closed[sw->closed_count ++] = key;
+    else sw->admission_disabled = true; 
+}
+/* 逐元素求和并合并贡献位图和标志；调用者必须先保证贡献不重叠、格式一致且数值合法。 */
+static void merge(atp_packet *dst,const atp_packet *src) {
+    for(unsigned v=0;v<dst->length;++v) dst->value[v]+=src->value[v];
+    dst->contributors |= src->contributors;
+    dst->ecn |= src->ecn; dst->collision |= src->collision;
+}
+/* 在 count 个配置中按作业编号 id 查找；返回配置指针，未找到返回 NULL。 */
+static atp_job *find_job(atp_job *jobs,unsigned count,uint32_t id) {
+    for(unsigned i=0;i<count;++i) 
+        if(jobs[i].job==id) 
+            return &jobs[i];
+    return NULL;
+}
+/* 将映射种子混入临时 seq 后计算槽下标；不会修改报文的真实分片编号。 */
+static uint32_t packet_index(const atp_packet *p,uint32_t capacity) {
+    atp_key key=p->key;key.seq ^= p->route_seed;return atp_hash(key,capacity);
+}
+/* 检查量化倍数、向量长度和映射种子/版本是否一致；分片标识和贡献位图另行检查。 */
+static bool same_contract(const atp_packet *a,const atp_packet *b) {
+    return a->scale==b->scale && a->length==b->length &&
+           a->route_seed==b->route_seed && a->route_version==b->route_version;
 }
 
-/* 检查该 <job, seq> 是否已经被重传解救过 */
-static bool is_rescued(atp_switch_t *sw, uint32_t job_id, uint16_t seq)
-{
-    for (uint32_t i = 0; i < sw->rescued_cnt; i++) {
-        if (sw->rescued[i].job_id == job_id && sw->rescued[i].seq == seq)
-            return true;
+/* 处理一个输入包：now 为仿真时刻，congestion 为本次拥塞信号。
+ * 返回 FORWARD 时 output/out 才可用于发送；CONSUMED 表示本地吸收，INVALID 表示拒绝。
+ * 同一交换机状态须串行访问；此函数不收发网络包，也不读取真实时钟。 */
+atp_action atp_switch_process(atp_switch *sw, const atp_packet *input,
+                             uint64_t now,bool congestion,atp_packet *out) {
+    if(!sw || !sw->slots || !out || !input) return ATP_INVALID;
+    atp_job *job=find_job(sw->jobs,sw->job_count,input->key.job);
+    /* expected 是本节点待聚齐的成员集合；members 是整个作业的集合，供返回 ACK 校验。 */
+    uint32_t expected=job ? job->local : sw->expected;
+    uint32_t members=job ? job->members : sw->job_members;
+    if((sw->job_count && !job) ||
+       (job && (input->scale!=job->scale || (job->retired && input->key.iteration<=job->retired_iteration))) ||
+       !atp_packet_valid(input,input->type==ATP_ACK ? members : expected)) {
+        ++sw->invalid;return ATP_INVALID;
+    }
+    *out=*input;
+    if(out->type==ATP_DATA) out->ecn |= congestion;
+    /* s 为映射目标槽；match 同时要求槽已占用且属于同一分片。 */
+    atp_slot *s = &sw->slots[packet_index(out, sw->capacity)];
+    bool match = s->occupied && atp_key_equal(s->aggregate.key,out->key);
+    if(match && !same_contract(&s->aggregate,out)) { ++ sw->invalid;return ATP_INVALID; }
+    /* ACK 释放匹配槽并留下墓碑；即使槽未命中也继续向 Worker 转发。 */
+    if(out->type==ATP_ACK) {  
+        if(match) memset(s,0,sizeof(*s));
+        close_key(sw,out->key); 
+        return ATP_FORWARD;
+    }
+    /* 重传恢复：L1 可取回已缓存的贡献；L2 丢弃旧聚合，后续由 PS 完成去重汇总。 */
+    if(out->resend) {
+        if(match) {
+            if(sw->level==1) {
+                /* overlap 为已缓存贡献和来包贡献的交集，非 Worker 数量。 */
+                /* 交集等于来包位图表示完整重复；仅部分重叠时不能安全累加。 */
+                uint32_t overlap = s->aggregate.contributors & out->contributors;
+                if(!overlap) merge(&s->aggregate,out);
+                /* 部分重叠，无法拆出单 Worker 值：清槽并旁路原包，交由重传恢复。 */
+                else if(overlap != out->contributors) {
+                    memset(s,0,sizeof(*s)); close_key(sw,out->key);
+                    out->bypass = true; return ATP_FORWARD;
+                }
+                s->aggregate.ecn |= out->ecn; //拥塞标记，只要有一个包携带拥塞标志就记录为拥塞
+                *out = s->aggregate;
+            }
+            
+            memset(s,0,sizeof(*s));
+        }
+        close_key(sw,out->key); 
+        out->resend = true; 
+        out->bypass = true;
+        return ATP_FORWARD;
+    }
+    /* 旁路包直接前进，避免在后续层重新创建聚合依赖。 */
+    if(out->bypass) return ATP_FORWARD;
+    if(!match && (is_closed(sw,out->key) || sw->admission_disabled)) {
+        out->bypass=true; return ATP_FORWARD;
+    }
+    /* 槽冲突：保护原槽，给来包标记碰撞并旁路到 PS。 */
+    if(s->occupied && !match) {
+        ++sw->fallbacks; out->collision=true; out->bypass=true; return ATP_FORWARD;
+    }
+    if(!match) {
+        s->occupied=true; s->aggregate=*out; s->last_progress=now;
+    } else {
+        /* 交集等于来包位图表示完整重复；仅部分重叠时不能安全累加。 */
+        uint32_t overlap=s->aggregate.contributors & out->contributors;
+        s->aggregate.ecn |= out->ecn;
+        if(overlap) {
+            if(overlap==out->contributors) { ++sw->duplicates; return ATP_CONSUMED; }
+            out->bypass=true; return ATP_FORWARD; 
+        }
+        merge(&s->aggregate,out); s->last_progress=now;
+    }
+    /* 成员凑齐只发一次；不能立即清槽，否则 ACK 丢失后的恢复会丢失缓存状态。 */
+    if(s->aggregate.contributors==expected && !s->result_sent) {
+        *out=s->aggregate; s->result_sent=true; ++sw->emitted;
+        return ATP_FORWARD; 
+    }
+    return ATP_CONSUMED;
+}
+/* 关闭超过 timeout 个 tick 没有新增贡献的槽；只回收状态，可靠恢复由 Worker 重传驱动。 */
+void atp_switch_expire(atp_switch *sw,uint64_t now,uint64_t timeout) {
+    if(!sw || !sw->slots) return;
+    for(uint32_t i=0;i<sw->capacity;++i) {
+        atp_slot *s=&sw->slots[i];
+        if(s->occupied && now>=s->last_progress && now-s->last_progress>=timeout) {
+            close_key(sw,s->aggregate.key); memset(s,0,sizeof(*s)); ++sw->expired;
+        }
+    }
+}
+
+
+/* 更新可复现的 xorshift32 随机状态；用于丢包、重复和延迟注入，不用于密码学。 */
+static unsigned random_next(atp_sim *sim) {
+    /* x 是本轮伪随机状态；避免 xorshift 停留在全零状态。 */
+    uint32_t x=sim->rng ? sim->rng : 1;
+    x^=x<<13;x^=x>>17;x^=x<<5;sim->rng=x;return x;
+}
+/* 判断分片迭代号是否落入已回收区间；回收下界生效后拒绝迟到包。 */
+static bool stale(const atp_job *job,atp_key key) {
+    return job && job->retired && key.iteration<=job->retired_iteration;
+}
+/* 将报文复制到有界事件队列，设置目的节点和到达时刻；队列满则记一次丢包并返回 false。 */
+static bool enqueue(atp_sim *sim,atp_dest dest,unsigned endpoint,const atp_packet *p) {
+    if(sim->queue_count>=sim->queue_limit) { ++sim->drops;return false; }
+    for(unsigned i=0;i<ATP_EVENTS;++i) if(!sim->events[i].used) {
+        atp_event *e=&sim->events[i];e->used=true;e->packet=*p;e->dest=dest;e->endpoint=endpoint;
+        e->due=sim->now+1+(sim->max_delay ? random_next(sim)%sim->max_delay : 0);
+        ++sim->queue_count;return true;
+    }
+    ++sim->drops;return false;
+}
+/* 模拟一跳发送：校验、编解码、丢包/重复注入，再入队；true 仅表示原包成功入队，不保证交付。
+ * endpoint：L1 方向为机架编号，ACK_WORKER 为 Worker 编号，L2/PS 调用处使用 0。 */
+bool atp_sim_inject(atp_sim *sim, atp_dest dest, unsigned endpoint, const atp_packet *p) {
+    if(!sim || !p || (unsigned)dest>=ATP_DEST_COUNT) return false;
+    atp_job *job=find_job(sim->jobs,sim->job_count,p->key.job);
+    if(stale(job,p->key)) { ++sim->stale;return false; }
+    if(!job || p->scale!=job->scale || !atp_packet_valid(p,job->members) ||
+       ((dest<=ATP_TO_PS)!=(p->type==ATP_DATA)) ||
+       ((dest==ATP_TO_L1 || dest==ATP_ACK_L1) && endpoint>=sim->racks) ||
+       (dest==ATP_ACK_WORKER && (endpoint>=sim->workers || !(job->members&(UINT32_C(1)<<endpoint))))) return false;
+    
+    /* wire 为临时字节缓冲区，decoded 为往返编解码得到的独立报文对象。 */
+    uint8_t wire[ATP_WIRE_MAX];atp_packet decoded;
+    /* n 是实际编码字节数，0 表示编码失败。 */
+    size_t n=atp_packet_encode(p,wire,sizeof(wire));
+    if(!n || !atp_packet_decode(&decoded,wire,n)) { ++sim->invalid;return false; }
+    ++sim->tx_attempts;
+    if(sim->drop_next[dest]) { --sim->drop_next[dest];++sim->drops;return false; }
+    if(random_next(sim)%1000<sim->loss_per_mille) { ++sim->drops;return false; }
+    bool ok=enqueue(sim,dest,endpoint,&decoded);
+    if(ok && random_next(sim)%1000<sim->duplicate_per_mille) (void)enqueue(sim,dest,endpoint,&decoded);
+    return ok;
+}
+/* 创建 workers 个 Worker、racks 个 L1 和一个 L2；每台交换机有 pool_size 个槽；失败返回 NULL。 */
+atp_sim *atp_sim_create(unsigned workers,unsigned racks,uint32_t pool_size) {
+    if(!workers || workers>ATP_WORKERS || !racks || racks>ATP_RACKS || racks>workers || !pool_size) return NULL;
+    atp_sim *sim=calloc(1,sizeof(*sim));if(!sim) return NULL;
+    sim->workers=workers;sim->racks=racks;
+    sim->expected=workers==32 ? UINT32_MAX : (UINT32_C(1)<<workers)-1;
+    /* masks 保存各机架成员位图；Worker 按 w % racks 分布。 */
+    uint32_t masks[ATP_RACKS]={0};
+    for(unsigned w=0;w<workers;++w) { sim->rack_of[w]=w%racks;masks[w%racks]|=UINT32_C(1)<<w; }
+    for(unsigned r=0;r<racks;++r)
+        if(!atp_switch_init(&sim->l1[r],pool_size,masks[r],1)) { atp_sim_destroy(sim);return NULL; }
+    for(unsigned r=0;r<racks;++r) sim->l1[r].job_members=sim->expected;
+    if(!atp_switch_init(&sim->l2,pool_size,sim->expected,2)) { atp_sim_destroy(sim);return NULL; }
+    sim->queue_limit=ATP_EVENTS;sim->service_budget=64;sim->ecn_threshold=32;
+    sim->rng=1;sim->max_delay=3;sim->rto=80;sim->slot_timeout=300;sim->max_attempts=30;
+    sim->initial_window=4;sim->initial_ssthresh=16;sim->ai_step=1;return sim;
+}
+/* 释放仿真器及所有交换机槽；允许 sim 为 NULL。 */
+void atp_sim_destroy(atp_sim *sim) {
+    if(!sim) return;
+    for(unsigned r=0;r<ATP_RACKS;++r) atp_switch_destroy(&sim->l1[r]);
+    atp_switch_destroy(&sim->l2);free(sim);
+}
+/* 为作业配置全局成员位图 members 和量化倍数 scale，并下发各层本地成员；已有配置仅接受相同参数。 */
+bool atp_sim_configure_job(atp_sim *sim,uint32_t id,uint32_t members,uint32_t scale) {
+    if(!sim || !id || !members || (members&~sim->expected) || !scale) return false;
+    atp_job *old=find_job(sim->jobs,sim->job_count,id);
+    if(old) return old->members==members && old->scale==scale;
+    if(sim->job_count>=ATP_JOBS) return false;
+    atp_job job={0};job.job=id;job.members=members;job.local=members;job.scale=scale;
+    sim->jobs[sim->job_count++]=job;
+    sim->l2.jobs[sim->l2.job_count++]=job;
+    for(unsigned r=0;r<sim->racks;++r) {
+        job.local=0;
+        for(unsigned w=0;w<sim->workers;++w)
+            if(sim->rack_of[w]==r) job.local |= members&(UINT32_C(1)<<w);
+        sim->l1[r].jobs[sim->l1[r].job_count++]=job;
+    }
+    return true;
+}
+/* 比较作业、迭代、张量三个字段；seq 不参与流身份，同一流中的分片共享发送窗口。 */
+static bool same_flow(atp_key a,atp_key b) {
+    return a.job==b.job && a.iteration==b.iteration && a.tensor==b.tensor;
+}
+/* 提交一个有效长度为 length 的分片并复制输入；同一流 seq 必须递增；容量/参数不合法返回 false。
+ * 提交时冻结映射描述；后续 ACK 的映射反馈只影响以后提交的分片。 */
+bool atp_sim_add_vector(atp_sim *sim,atp_key key,const atp_input *values,unsigned length) {
+    if(!sim || !values || !key.job || !length || length>ATP_VALUES || sim->count>=ATP_FRAGMENTS ||
+       !sim->initial_window || sim->initial_window>ATP_FRAGMENTS || !sim->initial_ssthresh ||
+       !sim->ai_step || sim->ai_step>ATP_FRAGMENTS) return false;
+    atp_job *job=find_job(sim->jobs,sim->job_count,key.job);
+    if(!job) {
+        if(!atp_sim_configure_job(sim,key.job,sim->expected,1)) return false;
+        job=find_job(sim->jobs,sim->job_count,key.job);
+    }
+    if(!job) return false;
+    if(stale(job,key)) return false;
+    /* index 是流表下标；ATP_FLOWS 作为尚未找到可用表项的哨兵值。 */
+    unsigned index=ATP_FLOWS;
+    for(unsigned i=0;i<ATP_FLOWS;++i)
+        if(sim->flows[i].used && same_flow(sim->flows[i].id,key)) { index=i;break; }
+    if(index==ATP_FLOWS)
+        for(unsigned i=0;i<ATP_FLOWS;++i) if(!sim->flows[i].used) {
+            index=i;atp_flow *flow=&sim->flows[i];memset(flow,0,sizeof(*flow));flow->used=true;flow->id=key;
+            for(unsigned w=0;w<sim->workers;++w) {
+                flow->worker[w].window=sim->initial_window;
+                flow->worker[w].ssthresh=sim->initial_ssthresh;
+            }
+            break;
+        }
+    if(index==ATP_FLOWS) return false;
+    atp_flow *flow=&sim->flows[index];
+    if(flow->has_seq && key.seq<=flow->last_seq) return false;
+    flow->has_seq=true;flow->last_seq=key.seq;
+    atp_fragment *f=&sim->fragments[sim->count++];memset(f,0,sizeof(*f));
+    f->key=key, f->members=job->members, f->scale=job->scale, f->length=length, f->flow=index;
+    
+    /* 提交时复制已共同确认的映射；活跃分片不会随后续反馈改变槽位置。 */
+    f->route_seed=flow->seed;f->route_version=flow->version;
+    memcpy(f->input,values->value,sizeof(f->input));return true;
+}
+/* 以 ATP_VALUES 个元素提交分片，是 atp_sim_add_vector 的固定长度便捷入口。 */
+bool atp_sim_add(atp_sim *sim,atp_key key,const atp_input *values) {
+    return atp_sim_add_vector(sim,key,values,ATP_VALUES);
+}
+/* 按完整分片标识查找主机侧状态；未找到返回 NULL。 */
+static atp_fragment *find_fragment(atp_sim *sim,atp_key key) {
+    for(unsigned i = 0; i < sim->count; ++ i) 
+        if(atp_key_equal(sim->fragments[i].key, key)) return &sim->fragments[i];
+    return NULL;
+}
+/* 生成携带分片身份、长度、量化倍数和映射版本的空包；调用者再填写类型、贡献和数据。 */
+static atp_packet descriptor(const atp_fragment *f) {
+    atp_packet p={0};
+    p.key = f->key;
+    p.length = f->length;
+    p.scale = f->scale;
+    p.route_seed = f->route_seed;
+    p.route_version = f->route_version;
+    return p;
+}
+/* 将 PS 缓存的最终和、拥塞/碰撞反馈放入 ACK，经 L2 返回；发送失败等待后续重传触发重发。 */
+static void send_ack(atp_sim *sim,const atp_fragment *f) {
+    atp_packet p=descriptor(f);p.type=ATP_ACK;p.contributors=f->members;
+    p.ecn=f->ecn;p.collision=f->collision;p.next_seed=f->next_seed;p.next_version=f->next_version;
+    memcpy(p.value,f->sum,sizeof(p.value));(void)atp_sim_inject(sim,ATP_ACK_L2,0,&p);
+}
+/* PS 接收端去重并累计互不重叠的贡献；凑齐成员后仅交付一次结果，并缓存结果用于重复回复 ACK。 */
+static void ps_process(atp_sim *sim,atp_fragment *f,const atp_packet *p) {
+    if(f->failed) return;
+    if(f->done) { send_ack(sim,f);return; }
+    f->ecn |= p->ecn;f->collision |= p->collision;
+    /* PS 已收贡献与本包的交集；任何重叠都不能直接加，缺失贡献由后续重传补齐。 */
+    uint32_t overlap=f->seen&p->contributors;
+    if(overlap) { if(overlap!=p->contributors) ++sim->overlaps;return; }
+    for(unsigned v=0;v<f->length;++v) f->sum[v]+=p->value[v];
+    f->seen |= p->contributors;
+    if(f->seen==f->members) {
+        f->done=true;++f->deliveries;atp_flow *flow=&sim->flows[f->flow];
+        if(f->collision && flow->proposed_version<UINT32_MAX) {
+            ++flow->proposed_version;flow->proposed_seed+=UINT32_C(0x9e3779b9);
+        }
+        f->next_seed=flow->proposed_seed;f->next_version=flow->proposed_version;
+        send_ack(sim,f);
+    }
+}
+/* 拥塞或重传时将窗口减半（至少 1）；一个 RTO 恢复期内避免重复减窗。 */
+static void decrease(atp_sim *sim,atp_sender *sender) {
+    if(sim->now<sender->recovery_until) return;
+    sender->window=sender->window>1 ? sender->window/2 : 1;
+    sender->ssthresh=sender->window;sender->credit=0;
+    sender->recovery_until=sim->now+sim->rto;++sender->reductions;
+}
+/* 仅对本流连续已确认前缀计入拥塞控制，避免乱序 ACK 提前增长窗口；每个分片每个 Worker 只计一次。 */
+static void congestion_ack(atp_sim *sim,atp_flow *flow,unsigned w) {
+    uint32_t bit=UINT32_C(1)<<w;atp_sender *sender=&flow->worker[w];
+    
+    for(unsigned i=0;i<sim->count;++i) {
+        atp_fragment *f=&sim->fragments[i];
+        if(!same_flow(flow->id,f->key) || f->failed || (f->cc_applied&bit)) continue;
+        if(!(f->acked&bit)) break;
+        f->cc_applied|=bit;
+        if(f->ecn) decrease(sim,sender);
+        else if(sim->now>=sender->recovery_until) {
+            /* add 是本次窗口增长量；慢启动逐确认增长，拥塞避免累计满一窗口确认后增长。 */
+            unsigned add=0;
+            if(sender->window<sender->ssthresh) add=sim->ai_step;
+            else if(++sender->credit>=sender->window) { add=sim->ai_step;sender->credit=0; }
+            sender->window=add>ATP_FRAGMENTS-sender->window ? ATP_FRAGMENTS : sender->window+add;
+        }
+    }
+}
+/* 若最早未确认分片之后已有至少 3 个不同分片被确认，请求一次快速重传；重复 ACK 不增加计数。 */
+static void gap_detection(atp_sim *sim,unsigned flow_id,unsigned w) {
+    /* bit 标识当前 Worker；missing 为最早缺 ACK 的已发送分片；higher 为其后不同已确认分片数。 */
+    uint32_t bit=UINT32_C(1)<<w;atp_fragment *missing=NULL;unsigned higher=0;
+    for(unsigned i=0;i<sim->count;++i) {
+        atp_fragment *f=&sim->fragments[i];
+        if(f->flow!=flow_id || f->failed || !(f->sent&bit)) continue;
+        if(!(f->acked&bit) && !missing) missing=f;
+        else if(missing && (f->acked&bit)) ++higher;
+    }
+    if(missing && higher>=3 && !(missing->fast_done&bit)) {
+        missing->fast_requested|=bit;missing->fast_done|=bit;
+    }
+}
+/* 收集各成员收到的最新映射建议；所有成员确认当前建议后才提交新版本。
+ * 这里依靠单进程共享状态协调；未来 DPDK/分布式部署仍需实现实际控制消息与同步。 */
+static void accept_feedback(atp_sim *sim,atp_fragment *f,const atp_packet *p,unsigned w) {
+    atp_flow *flow=&sim->flows[f->flow];atp_sender *sender=&flow->worker[w];
+    if(p->next_version>sender->feedback_version) {
+        sender->feedback_version=p->next_version;sender->feedback_seed=p->next_seed;
+    }
+    if(flow->proposed_version<=flow->version) return;
+    for(unsigned u=0;u<sim->workers;++u) if(f->members&(UINT32_C(1)<<u))
+        if(flow->worker[u].feedback_version!=flow->proposed_version ||
+           flow->worker[u].feedback_seed!=flow->proposed_seed) return;
+    flow->version=flow->proposed_version;flow->seed=flow->proposed_seed;++sim->rehashes;
+}
+/* 投递一个到期事件，驱动 DATA,仿真中的下一跳节点连接：Worker→L1→L2→PS，ACK：PS→L2→L1→Worker。 */
+static void dispatch(atp_sim *sim,const atp_event *e) {
+    const atp_packet *p=&e->packet;
+    atp_job *job = find_job(sim->jobs, sim->job_count, p->key.job);
+    if(stale(job,p->key)) { ++sim->stale;return; }
+    /* f 是目标主机分片；wanted 是提交时冻结的协议描述，用于拒绝不一致的来包。 */
+    atp_fragment *f = find_fragment(sim,p->key);
+    atp_packet wanted = {0};
+    if(f) 
+        wanted = descriptor(f);
+    if(!f || !atp_packet_valid(p,f->members) || !same_contract(&wanted,p) ||
+       ((e->dest<=ATP_TO_PS)!=(p->type==ATP_DATA))) { ++sim->invalid;return; }
+    /* out 接收交换机输出；ce 用全局仿真队列近似拥塞信号，不代表真实网卡队列。 */
+    atp_packet out;
+    bool ce = sim->queue_count > sim->ecn_threshold;
+    switch(e->dest) {
+        case ATP_TO_L1:
+            if(atp_switch_process(&sim->l1[e->endpoint],p,sim->now,ce,&out)==ATP_FORWARD)
+                (void)atp_sim_inject(sim,ATP_TO_L2,0,&out);
+            break;
+        case ATP_TO_L2:
+            if(atp_switch_process(&sim->l2,p,sim->now,ce,&out)==ATP_FORWARD)
+                (void)atp_sim_inject(sim,ATP_TO_PS,0,&out);
+            break;
+        case ATP_TO_PS: ps_process(sim,f,p);break;
+        case ATP_ACK_L2:
+            if(atp_switch_process(&sim->l2,p,sim->now,false,&out)!=ATP_FORWARD) break;
+            for(unsigned r=0;r<sim->racks;++r) {
+                atp_job *rack_job=find_job(sim->l1[r].jobs,sim->l1[r].job_count,p->key.job);
+                if(rack_job && rack_job->local)
+                    (void)atp_sim_inject(sim,ATP_ACK_L1,r,p);
+            }
+            break;
+        case ATP_ACK_L1:
+            if(atp_switch_process(&sim->l1[e->endpoint],p,sim->now,false,&out)!=ATP_FORWARD) break;
+            for(unsigned w=0;w<sim->workers;++w)
+                if(sim->rack_of[w]==e->endpoint && (f->members&(UINT32_C(1)<<w)))
+                    (void)atp_sim_inject(sim,ATP_ACK_WORKER,w,p);
+            break;
+        case ATP_ACK_WORKER: {
+            unsigned w = e->endpoint;
+            uint32_t bit=UINT32_C(1) << w;
+            if(!(f->sent & bit) || (f->acked & bit) || f->failed) break;
+            atp_flow *flow = &sim->flows[f->flow];
+            f->acked |= bit, -- flow->worker[w].inflight; //在途发送
+            memcpy(f->received[w], p->value, sizeof(p->value));
+            accept_feedback(sim, f, p, w);
+            congestion_ack(sim, flow, w);
+            gap_detection(sim, f->flow, w);
+            break;
+        }
+        default: ++sim->invalid;break;
+    }
+}
+/* 逐流逐 Worker 调度首次发送、超时重传和快速重传；达到尝试上限则标记分片失败并释放在途配额。 */
+static void worker_tick(atp_sim *sim) {
+    for(unsigned i = 0; i < sim->count; ++ i) {
+        atp_fragment *f = &sim->fragments[i];
+        if(f -> failed) continue;
+        for(unsigned w = 0; w < sim->workers; ++ w) {
+            uint32_t bit = UINT32_C(1) << w; //检查第w个worker，把第w个worker对应的bit位置置为1
+            if(!(f->members & bit) || (f->acked & bit)) continue;
+            atp_sender *sender=&sim->flows[f->flow].worker[w];
+            /* retry 表示曾发送过；fast 表示缺口检测已请求快速重传，可跳过 RTO【重传超时时间】 等待。 */
+            bool retry = (f->sent & bit) != 0, fast=(f->fast_requested & bit) != 0;
+            if(retry && !fast && sim->now - f->last_send[w] < sim->rto) continue;
+            if(!retry && sender->inflight >= sender->window) continue;
+            /* 尝试上限是整个分片的终止失败条件；同时释放所有尚未确认成员的在途配额。 */
+            if(f->attempts[w]>=sim->max_attempts) {
+                f->failed=true;
+                for(unsigned u=0;u<sim->workers;++u)
+                    if((f->sent&~f->acked)&(UINT32_C(1)<<u)) --sim->flows[f->flow].worker[u].inflight;
+                break;
+            }
+            atp_packet p = descriptor(f);
+            p.type = ATP_DATA;
+            p.contributors = bit;
+            p.resend = retry;
+            for(unsigned v=0;v<f->length;++v) p.value[v]=f->input[w][v];
+            if(!retry) { f->sent|=bit;++sender->inflight; }
+            else { ++sim->retries;decrease(sim,sender);if(fast) ++sim->fast_retries; }
+            f->fast_requested &= ~bit;++f->attempts[w];f->last_send[w]=sim->now;
+            if(!(sim->offline&bit)) (void)atp_sim_inject(sim,ATP_TO_L1,sim->rack_of[w],&p);
+        }
+    }
+}
+/* 检查交换机是否仍有占用槽，供仿真结束条件使用。 */
+static bool switch_busy(const atp_switch *sw) {
+    for(uint32_t i=0;i<sw->capacity;++i) if(sw->slots[i].occupied) return true;
+    return false;
+}
+/* 最多推进 ticks 个逻辑时钟步；全部成功且事件/槽排空才返回 true。
+ * false 可能是参数错误、时间预算不足或终止失败，需结合 fragment.failed 等状态判断。 */
+bool atp_sim_run(atp_sim *sim,uint64_t ticks) {
+    if(!sim || !sim->rto || !sim->max_attempts || sim->now>UINT64_MAX-ticks ||
+       sim->now+ticks>UINT64_MAX-sim->rto || sim->now+ticks>UINT64_MAX-sim->max_delay-1) return false;
+    for(uint64_t t=0;t<ticks;++t) {
+        ++sim->now;worker_tick(sim);
+        for(unsigned n=0;n<sim->service_budget;++n) {
+            /* next/due 记录本轮最早到期事件；ATP_EVENTS 表示没有可投递事件。 */
+            unsigned next=ATP_EVENTS;uint64_t due=UINT64_MAX;
+            for(unsigned i=0;i<ATP_EVENTS;++i)
+                if(sim->events[i].used && sim->events[i].due<=sim->now && sim->events[i].due<due) {
+                    next=i;due=sim->events[i].due;
+                }
+            if(next==ATP_EVENTS) break;
+            atp_event e=sim->events[next];sim->events[next].used=false;--sim->queue_count;dispatch(sim,&e);
+        }
+        for(unsigned r=0;r<sim->racks;++r) atp_switch_expire(&sim->l1[r],sim->now,sim->slot_timeout);
+        atp_switch_expire(&sim->l2,sim->now,sim->slot_timeout);
+        /* finished 表示无仍待确认的非失败分片；success 额外要求没有终止失败。 */
+        bool finished=true,success=true;
+        for(unsigned i=0;i<sim->count;++i) {
+            if(sim->fragments[i].failed) success=false;
+            else if(sim->fragments[i].acked!=sim->fragments[i].members) finished=false;
+        }
+        if(finished && !sim->queue_count) {
+            bool busy=switch_busy(&sim->l2);
+            for(unsigned r=0;r<sim->racks;++r) busy |= switch_busy(&sim->l1[r]);
+            if(!busy) return success;
+        }
     }
     return false;
 }
-
-/* 标记该 <job, seq> 已被重传解救 */
-static void mark_rescued(atp_switch_t *sw, uint32_t job_id, uint16_t seq)
-{
-    if (sw->rescued_cnt >= RESCUED_MAX) {
-        /* 表满：简单处理，覆盖最旧的（FIFO），或扩容。仿真里直接忽略。 */
-        fprintf(stderr, "[Warn] rescued table full, dropping oldest entry\n");
-        /* 左移覆盖第一个 */
-        memmove(&sw->rescued[0], &sw->rescued[1], 
-                (RESCUED_MAX - 1) * sizeof(rescued_entry_t));
-        sw->rescued_cnt = RESCUED_MAX - 1;
-    }
-    sw->rescued[sw->rescued_cnt].job_id = job_id;
-    sw->rescued[sw->rescued_cnt].seq = seq;
-    sw->rescued_cnt++;
+/* 判断 key 是否属于指定作业且 iteration 不大于 through（包含端点）。 */
+static bool affected(atp_key key,uint32_t job,uint32_t through) {
+    return key.job==job && key.iteration<=through;
 }
-
-/*
-atp_switch_t 结构体用于管理和跟踪与 ATP（异步传输协议）相关的状态和数据，
-跟踪控制数据流
-包括池的指针、池的大小、数据包队列及其相关的状态信息，如已消费、回退和完成的计数。
-*/
-atp_switch_t* switch_create_with_id(uint32_t pool_size, uint8_t switch_id)
-{
-    atp_switch_t *sw = calloc(1, sizeof(atp_switch_t));
-    if (!sw) {
-        fprintf(stderr, "[Error] switch_create: calloc(sw) failed\n");
-        return NULL;
-    }
-
-
-    sw->pool_size = pool_size;
-    sw->pool = calloc(pool_size, sizeof(agg_slot_t));
-    if (!sw->pool) {
-        fprintf(stderr, "[Error] switch_create: calloc(pool) failed\n");
-        free(sw);          /* 回滚：释放已分配的 sw */
-        return NULL;
-    }
-    
-    sw->ps_cap = 4096;
-    sw->ps_queue = calloc(sw->ps_cap, sizeof(atp_packet_t));
-    if (!sw->ps_queue) {
-        fprintf(stderr, "[Error] switch_create: calloc(ps_queue) failed\n");
-        free(sw->pool); //回滚:按分配逆序释放
-        free(sw);
-        return NULL;
-    }
-
-    /*ECN*/
-    sw->egress_queue_depth = 0;
-    sw->ecn_threshold = 1; /* 默认的阈值, 测试中可覆盖 */
-
-    sw->switch_id = switch_id;
-    return sw;
+/* 检查待回收区间内是否仍有占用槽；有则不能通过回收屏障。 */
+static bool can_retire_switch(const atp_switch *sw,uint32_t job,uint32_t through) {
+    for(uint32_t i=0;i<sw->capacity;++i)
+        if(sw->slots[i].occupied && affected(sw->slots[i].aggregate.key,job,through)) return false;
+    return true;
 }
-
-atp_switch_t* switch_create(uint32_t pool_size)
-{
-    return switch_create_with_id(pool_size, 0);
-}
-
-static void send_to_ps(atp_switch_t *sw, atp_packet_t *pkt)
-{
-    if (sw->ps_tail >= sw->ps_cap) {
-        fprintf(stderr, "PS queue overflow\n");
-        exit(1);
-    }
-    sw->ps_queue[sw->ps_tail++] = *pkt;
-    sw->egress_queue_depth++; /* 模拟包进入出口队列，深度增加 */
-}
-
-/* 新增：根据出口队列深度标记 ECN */
-static inline void check_and_mark_ecn(atp_switch_t *sw, atp_packet_t *pkt)
-{
-    if (sw->egress_queue_depth > sw->ecn_threshold) {
-        pkt->ecn = true;
-    }
-}
-
-/* 
- * 处理重传包（论文 §3.7 核心）
- * 一级交换机行为：若聚合器存在，合并该 Worker（如未合并过），
- *                然后强制把结果（  可能部分聚合）发给 PS，释放槽位。
- */
-static void switch_process_resend(atp_switch_t *sw, atp_packet_t *pkt)
-{
-    check_and_mark_ecn(sw, pkt); /* 新增：检查出口队列深度，标记 ECN */
-
-    /* 新增：第二级 Switch 直接转发重传包，不尝试聚合（论文 §3.7 / §A.1） */
-    if (pkt->edgeSwitchIdentifier == 1) {
-        printf("  [Switch] L2 重传直发PS: Job%d Seq%d\n", pkt->job_id, pkt->seq);
-        send_to_ps(sw, pkt);
-        return;
-    }
-    
-    uint16_t idx = hash_idx(pkt->job_id, pkt->seq, sw->pool_size);
-    agg_slot_t *slot = &sw->pool[idx];
-
-    uint32_t sender_bit = pkt->bitmap0;  /* 重传解救只发生在第一级 */
-
-    /* 聚合器存在且匹配：合并并强制释放 */
-    if (slot->job_id == pkt->job_id && slot->seq == pkt->seq) {
-        if (!(slot->bitmap & sender_bit)) {
-            slot->sum += pkt->data;
-            slot->bitmap |= sender_bit;
-            slot->count++;
-
-            slot->ecn |= pkt->ecn; /* 合并，累积 ECN 状态 */
-        }
-
-        /*
-         * 修复 B：交换机结果包必须携带聚合器当前的 bitmap 和 count，
-         * 让 PS 知道这是"部分聚合"还是"完整聚合"。
-         */
-
-        atp_packet_t result = {
-            .job_id = pkt->job_id,
-            .seq = pkt->seq,
-            .worker_id = 0xFF,
-            .data = slot->sum,
-            .fan_in = pkt->fan_in,
-            .collision = false,
-            .from_switch = true,
-            .bitmap = slot->bitmap,
-            .count = slot->count,
-            .ecn = slot->ecn,  /* 新增：携带累积的 ECN 状态 */
-            /* 新增：多级聚合字段透传 */
-            .edgeSwitchIdentifier = pkt->edgeSwitchIdentifier,
-            .bitmap0 = pkt->bitmap0,
-            .bitmap1 = pkt->bitmap1,
-            .fanInDegree0 = pkt->fanInDegree0,
-            .fanInDegree1 = pkt->fanInDegree1
-        };
-
-        if (pkt->edgeSwitchIdentifier == 0) {
-            result.edgeSwitchIdentifier = 1;
-            result.bitmap1 = (1u << sw->switch_id);
-        }
-        /* 强制发 PS 并释放槽位 */
-        send_to_ps(sw, &result);
-        
-
-        memset(slot, 0, sizeof(*slot));
-        sw->completed++;
-        
-        /* 新增：标记该 <job, seq> 已被解救，后续同 Seq 包禁止预留 */
-        mark_rescued(sw, pkt->job_id, pkt->seq);
-        
-        printf("  [Switch] 槽位%2d 重传解救并标记: Job%d Seq%d -> 后续禁止预留\n", idx, pkt->job_id, pkt->seq);
-        return;
-        
-    }
-
-    /* 聚合器已不存在（可能被 ACK 释放或超时清理过）：直接转发原始包到 PS */
-    printf("  [Switch] 槽位%2d 重传转发: 聚合器已释放, 原始包直发PS (ECN=%d)\n", idx, pkt->ecn);
-    send_to_ps(sw, pkt);
-}
-
-
-
-
-/* 
- * 交换机核心：尽力而为的三种路径
- * 用于处理交换机中的数据包，根据槽位的状态（空闲、自己的或冲突）执行相应的操作，
- * 包括预留槽位、累加数据或将数据包发送到处理系统（PS）。
- * 该函数通过哈希索引确定槽位，并在处理过程中更新交换机的状态和统计信息
- */
-void switch_process(atp_switch_t *sw, atp_packet_t *pkt)
-{
-
-    sw->global_time++;  /* 全局时钟推进 */
-
-    /* 新增：根据 edgeSwitchIdentifier 选择当前层级的 sender_bit 和 fanInDegree */
-    uint32_t sender_bit = (pkt->edgeSwitchIdentifier == 0) ? pkt->bitmap0 : pkt->bitmap1;
-    uint8_t  cur_fanin  = (pkt->edgeSwitchIdentifier == 0) ? pkt->fanInDegree0 : pkt->fanInDegree1;
-    
-    check_and_mark_ecn(sw, pkt); /* 新增：检查出口队列是否堵塞 */
-
-    /* 如果是重传包，走专门逻辑 */
-    if (pkt->resend) {
-        switch_process_resend(sw, pkt);
-        return;
-    }
-
-    uint16_t idx = hash_idx(pkt->job_id, pkt->seq, sw->pool_size);
-    agg_slot_t *slot = &sw->pool[idx];
-
-    /* ---- 路径 A：槽位空闲 (job_id == 0) -> FCFS 预留 ---- *///⭐是/必须是FCFS吗?
-    if (slot->job_id == 0) {  /* 修复1：用 job_id==0 判断空闲，job_id会从1开始,0默认无效 */
-       
-        /* 新增：如果该 <job, seq> 已被重传解救过，说明聚合器曾经存在但被强制释放了。
-        * 此时不应再预留槽位（否则后续重传包会形成新的孤儿聚合器），直接转发到 PS。 */
-        if (is_rescued(sw, pkt->job_id, pkt->seq)) {
-            send_to_ps(sw, pkt);
-            printf("  [Switch] 槽位%2d 拒绝预留: Job%d Seq%d 已被重传解救过,直接发PS\n",
-                idx, pkt->job_id, pkt->seq);
-            return;
-        }
-       
-        // 正常预留
-        slot->job_id = pkt->job_id;
-        slot->seq = pkt->seq;
-        slot->sum = pkt->data;
-        slot->bitmap = sender_bit; //(1u << pkt->worker_id);//1U 是一个无符号整数常量，表示值为 1 的无符号整型。它通常用于需要确保数值为非负的场景
-        slot->ecn = pkt->ecn; /* 新增：继承包的 ECN 状态 */
-        slot->count = pkt->count;  /* 新增：继承包的 count，通常为1 */
-        slot->timestamp = sw->global_time;
-
-        /* 用 bitmap popcount 判断完成，兼容多级聚合 */
-        uint32_t b = slot->bitmap;
-        uint8_t popcnt = 0;
-        while (b) { popcnt++; b &= b - 1; }
-        /* ===== 新增：预留后即满足 fan-in，直接完成（L2 单输入/多输入首包场景） ===== */
-        
-        if (popcnt >= cur_fanin && pkt->edgeSwitchIdentifier == 0) {
-            uint8_t  out_id = pkt->edgeSwitchIdentifier;
-            uint32_t out_bitmap1 = pkt->bitmap1;
-            if (pkt->edgeSwitchIdentifier == 0) {
-                out_id = 1;
-                out_bitmap1 = (1u << sw->switch_id);
-            }
-
-            atp_packet_t result = {
-                .job_id = pkt->job_id, .seq = pkt->seq, .worker_id = 0xFF,
-                .data = slot->sum, .fan_in = pkt->fan_in,
-                .collision = false, .from_switch = true,
-                .bitmap = slot->bitmap, .count = slot->count, .ecn = slot->ecn,
-                .edgeSwitchIdentifier = out_id,
-                .bitmap0 = pkt->bitmap0, .bitmap1 = out_bitmap1,
-                .fanInDegree0 = pkt->fanInDegree0, .fanInDegree1 = pkt->fanInDegree1
-            };
-            send_to_ps(sw, &result);
-
-            if (pkt->edgeSwitchIdentifier == 0)
-                printf("  [Switch] 槽位%2d 完成(L1): Job%d Seq%d -> 值=%d 发往L2 (ecn=%d)\n",
-                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
-            else
-                printf("  [Switch] 槽位%2d 完成(L2): Job%d Seq%d -> 值=%d 发往PS (ecn=%d)\n",
-                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
-
-            memset(slot, 0, sizeof(*slot));
-            sw->completed++;
-            printf("  [Switch] 槽位%2d 预留    : Job%d Seq%d Worker%d (data=%d)\n",
-               idx, pkt->job_id, pkt->seq, pkt->worker_id, pkt->data);
-            return;
-        }
-
-
-
-        sw->consumed++;
-        printf("  [Switch] 槽位%2d 预留    : Job%d Seq%d Worker%d (data=%d)\n",
-               idx, pkt->job_id, pkt->seq, pkt->worker_id, pkt->data);
-        return;
-    }
-
-    /* ---- 路径 B：槽位是自己的 -> 累加 ---- */
-    if (slot->job_id == pkt->job_id && slot->seq == pkt->seq) {
-        if (slot->bitmap & sender_bit) {  /* 修复 B：用 sender_bit 判断是否重复贡献 */
-            printf("  [Switch] 槽位%2d 重复    : Job%d Seq%d Worker%d -> 丢弃\n",
-                   idx, pkt->job_id, pkt->seq, pkt->worker_id);
-            sw->consumed++;
-            return;
-        }
-
-        slot->sum += pkt->data;
-        slot->bitmap |= sender_bit;  //设为1，表示该worker已经贡献过数据
-        slot->count += pkt->count;  /* 修复 B：累积 count */
-        slot->ecn |= pkt->ecn; /* 新增：累积 ECN 状态 */
-        slot->timestamp = sw->global_time;
-
-
-        /* 用 bitmap popcount 判断完成，兼容多级聚合 */
-        uint32_t b = slot->bitmap;
-        uint8_t popcnt = 0;
-        while (b) { popcnt++; b &= b - 1; }
-
-        /* 修复：L2 包（edgeSwitchIdentifier==1）禁止预留即完成，
-         * 必须等待至少两个 Rack 的部分和到齐（走路径 B 累加）。
-         * 这确保跨 Rack 聚合真正发生在 L2，而不是分别发给 PS。 */
-        if (popcnt >= cur_fanin ) {
-            /*
-             * 修复 B：正常聚合完成时，结果包携带完整 bitmap 和 count。
-             */
-
-            uint8_t  out_id = pkt->edgeSwitchIdentifier;
-            uint32_t out_bitmap1 = pkt->bitmap1;
-            if (pkt->edgeSwitchIdentifier == 0) {
-                out_id = 1;
-                out_bitmap1 = (1u << sw->switch_id);
-            }
-            atp_packet_t result = {
-                .job_id = pkt->job_id,
-                .seq = pkt->seq,
-                .worker_id = 0xFF,//255,哨兵值,不是worker发送的包是switch端
-                //255是 uint8_t 的最大值，不可能被真实 Worker 用到，所以天然安全，不会冲突。
-                .data = slot->sum,
-                .fan_in = pkt->fan_in,
-                .collision = false,
-                .from_switch = true,
-                .bitmap = slot->bitmap,
-                .count = slot->count,
-                .ecn = slot->ecn,  /* 新增：携带累积的 ECN 状态 */
-
-                /* 新增：多级聚合字段透传 */
-                .edgeSwitchIdentifier = out_id,
-                .bitmap0 = pkt->bitmap0,
-                .bitmap1 = out_bitmap1,
-                .fanInDegree0 = pkt->fanInDegree0,
-                .fanInDegree1 = pkt->fanInDegree1
-            };
-            send_to_ps(sw, &result);
-
-
-            if (pkt->edgeSwitchIdentifier == 0) {
-                printf("  [Switch] 槽位%2d 完成(L1): Job%d Seq%d -> 值=%d 发往L2 (ecn=%d)\n",
-                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
-            } else {
-                printf("  [Switch] 槽位%2d 完成(L2): Job%d Seq%d -> 值=%d 发往PS (ecn=%d)\n",
-                       idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
-            }
-
-            
-            // printf("  [Switch] 槽位%2d 完成    : Job%d Seq%d -> 值=%d (发往PS) (ECN=%d)\n",
-            //        idx, pkt->job_id, pkt->seq, slot->sum, slot->ecn);
-
-            memset(slot, 0, sizeof(*slot)); /* 释放槽位 */
-            sw->completed++;
-        } else {
-            printf("  [Switch] 槽位%2d 累加    : Job%d Seq%d %d/%d (bitmap=%u)\n",
-                   idx, pkt->job_id, pkt->seq, slot->count, cur_fanin, slot->bitmap);
-            sw->consumed++;
-        }
-        return;
-    }
-
-    /* ---- 路径 C：冲突 -> 尽力而为回退到 PS ---- */
-    pkt->collision = true;
-    send_to_ps(sw, pkt);
-    sw->fallback++;
-
-    printf("  [Switch] 槽位%2d 冲突回退: 被Job%dSeq%d占用,"
-           "Job%dSeq%dWorker%d -> 直接发PS (ECN=%d)\n",
-           idx, slot->job_id, slot->seq,
-           pkt->job_id, pkt->seq, pkt->worker_id, pkt->ecn);
-}
-
-
-/*
- * 超时扫描：清理孤儿聚合器（论文 §3.7 内存泄漏防护）
- */
-void switch_scan_timeout(atp_switch_t *sw, uint64_t threshold)
-{
-    for (uint32_t i = 0; i < sw->pool_size; i++) {
-        agg_slot_t *slot = &sw->pool[i];
-        if (slot->job_id != 0 &&
-            (sw->global_time - slot->timestamp) > threshold) {
-            printf("  [Switch] 槽位%2d 超时清理: Job%d Seq%d 孤儿聚合器强制释放\n",
-                   i, slot->job_id, slot->seq);
-            memset(slot, 0, sizeof(*slot));
-        }
-    }
-}
-
-
-
-/* 
- * PS 端处理
- *函数用于处理来自交换机的多个数据包，聚合数据并检查是否收齐所有必要的包。
- *它维护一个缓冲区以存储和更新每个作业的状态，
- *并在处理完成或未收齐时输出相应的日志信息。
- * 
- * 修复 A：增加 entry->done 前置检查，防止交换机结果包先到、原始 fallback 包后到
- *         导致的重复累加。
- * 修复 B：交换机结果包携带 bitmap/count，PS 端用通用 bitmap 去重逻辑处理，
- *         支持"部分聚合结果"的正确累加，不再盲目认为 from_switch=true 就是完整结果。
- */
-
-void ps_process(atp_switch_t *sw)
-{
-    ps_buffer_t buf[PS_BUF_MAX];//buf 是 PS 端的缓冲区，里面每个 buf[j] 代表一个“job + seq”的汇总状态
-    
-    uint32_t buf_cnt = 0;
-
-    printf("\n  --- PS 开始处理交换机转来的 %d 个包 ---\n", sw->ps_tail);
-
-    for (uint32_t i = 0; i < sw->ps_tail; i++) {
-        atp_packet_t *pkt = &sw->ps_queue[i];
-
-        /* 新增：包已到达 PS，从交换机出口队列出队 */
-        if (sw->egress_queue_depth > 0)
-            sw->egress_queue_depth--;
-
-        ps_buffer_t *entry = NULL;
-
-        for (uint32_t j = 0; j < buf_cnt; j++) {
-            if (buf[j].job_id == pkt->job_id && buf[j].seq == pkt->seq) {
-                entry = &buf[j];
-                break;
-            }
-        }
-        if (!entry) {
-            assert(buf_cnt < PS_BUF_MAX);
-            entry = &buf[buf_cnt++];  
-            memset(entry, 0, sizeof(*entry));
-            entry->job_id = pkt->job_id;
-            entry->seq = pkt->seq;
-            entry->fan_in = pkt->fan_in;
-        }
-
-        /* ========== 修复 A：如果该 (job, seq) 已经被标记为 done，直接忽略后续一切包 ========== */
-        if (entry->done) {
-            continue;
-        }
-
-        /* 新增：打印 ECN 拥塞信号 */
-        if (pkt->ecn) {
-            printf("  [PS] 检测到 ECN 标记: Job%d Seq%d (交换机出口拥塞)\n",
-                   pkt->job_id, pkt->seq);
-        }
-
-        /* ========== 修复 B：通用 bitmap 去重累加逻辑 ========== */
-        uint32_t overlap = entry->bitmap & pkt->bitmap;
-
-        if (overlap) {
-            /*
-             * 有重叠：说明 PS 已经收到了其中某些 Worker 的数据。
-             * 如果交换机结果包是"完整聚合"（count >= fan_in），直接用权威结果覆盖。
-             * 否则（部分聚合且有重叠），丢弃，因为无法拆分总和避免重复。
-             */
-            if (pkt->from_switch && pkt->count >= entry->fan_in) {
-                entry->sum = pkt->data;
-                entry->bitmap = pkt->bitmap;
-                entry->done = true;
-                printf("  [PS] 聚合完成: Job%d Seq%d = %d (交换机完整结果覆盖)\n",
-                       entry->job_id, entry->seq, entry->sum);
-            } else {
-                printf("  [PS] 丢弃重复: Job%d Seq%d (overlap bitmap=%u)\n",
-                       pkt->job_id, pkt->seq, overlap);
-            }
-            continue;
-        }
-
-        /* 无重叠：安全累加 */
-        //fallback包，仍然是原始 worker 数据包，需要按 worker 去合并
-        entry->sum += pkt->data;
-        entry->bitmap |= pkt->bitmap;
-        entry->count += pkt->count;  /* 修复 B：累计 count */
-
-        /* 检查是否收齐：用 bitmap 的 popcount【统计收到了多少个不同的worker的数据】
-         判断（比 count 更可靠） */
-        
-        uint32_t b = entry->bitmap;
-        uint8_t popcnt = 0;
-        while (b) { popcnt++; b &= b - 1; }  /* 计算 popcount */
-
-        if ((popcnt >= entry->fan_in || entry->count >= entry->fan_in) && !entry->done) {
-            printf("  [PS] 聚合完成: Job%d Seq%d = %d (PS端累加完成, bitmap=%u, count=%d)\n",
-                   entry->job_id, entry->seq, entry->sum, entry->bitmap, entry->count);
-            entry->done = true;
-        }
-    }
-
-
-    for (uint32_t j = 0; j < buf_cnt; j++) {
-        if (!buf[j].done) {
-            printf("  [PS] 警告: Job%d Seq%d 未收齐 (%d/%d)\n",
-                   buf[j].job_id, buf[j].seq, buf[j].count, buf[j].fan_in);
-        }
-    }
-}
-
-static void print_stats(atp_switch_t *sw, int total_packets)
-{
-    printf("\n========== 统计 ==========\n");
-    printf("总包数              : %d\n", total_packets);
-    printf("被交换机消费(省带宽): %lu\n", sw->consumed);
-    printf("尽力而为回退到PS    : %lu\n", sw->fallback);
-    printf("交换机完成聚合次数  : %lu\n", sw->completed);
-    printf("PS 收到包数        : %u\n", sw->ps_tail);
-    printf("带宽节省率         : %.1f%%\n",
-           100.0 * sw->consumed / total_packets);
-}
-
-static void reset_switch(atp_switch_t *sw)
-{
-    memset(sw->pool, 0, sw->pool_size * sizeof(agg_slot_t));
-    sw->ps_tail = 0;
-    sw->consumed = 0;
-    sw->fallback = 0;
-    sw->completed = 0;
-    sw->global_time = 0;
-    sw->egress_queue_depth = 0;   
-}
-
-static atp_packet_t make_pkt(uint32_t job, uint16_t seq, uint8_t wid, int val, uint8_t fan_in)
-{
-    return (atp_packet_t){
-        .job_id = job, .seq = seq, .worker_id = wid,
-        .data = val, .fan_in = fan_in,
-        .collision = false, .from_switch = false, .resend = false,
-        .bitmap = (1u << wid), /* 原始包只代表自己这一个 Worker */
-        .count = 1,
-        .ecn = false,  /* 默认无 ECN */
-
-        .edgeSwitchIdentifier = 0,
-        .bitmap0 = (1u << wid),
-        .bitmap1 = 0,
-        .fanInDegree0 = fan_in,
-        .fanInDegree1 = 1
-    };
-}
-
-void test1_no_contention(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 1: 单 Job, Pool 充足（无冲突）\n");
-    printf("########################################\n");
-    atp_switch_t *sw = switch_create(16);
-    atp_packet_t pkts[] = {
-        make_pkt(1, 0, 0, 10, 2),
-        make_pkt(1, 0, 1, 20, 2),
-        make_pkt(1, 1, 0, 100, 2),
-        make_pkt(1, 1, 1, 200, 2),
-    };
-    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-        switch_process(sw, &pkts[i]);
-    ps_process(sw);
-    print_stats(sw, 4);
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-
-void test2_contention_and_fallback(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 2: 双 Job, Pool=3 (故意冲突, 展示尽力而为回退)\n");
-    printf("########################################\n");
-    atp_switch_t *sw = switch_create(3);
-    atp_packet_t pkts[] = {
-        make_pkt(1, 0, 0, 10, 2),
-        make_pkt(2, 0, 0, 1000, 2),
-        make_pkt(1, 0, 1, 5, 2),
-        make_pkt(2, 0, 1, 500, 2),
-        make_pkt(1, 1, 0, 50, 2),
-        make_pkt(2, 1, 0, 5000, 2),
-        make_pkt(1, 1, 1, 60, 2),
-        make_pkt(2, 1, 1, 6000, 2),
-    };
-    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-        switch_process(sw, &pkts[i]);
-    ps_process(sw);
-    print_stats(sw, 8);
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-
-void test3_dynamic_reuse(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 3: Pool=2(极端), 展示 Job1 完成后槽位被 Job2 复用\n");
-    printf("########################################\n");
-    atp_switch_t *sw = switch_create(2);
-    atp_packet_t pkts[] = {
-        make_pkt(1, 0, 0, 1, 2),
-        make_pkt(1, 1, 0, 2, 2),
-        make_pkt(1, 0, 1, 3, 2),
-        make_pkt(1, 1, 1, 4, 2),
-        make_pkt(2, 0, 0, 100, 2),
-        make_pkt(2, 1, 0, 200, 2),
-        make_pkt(2, 0, 1, 300, 2),
-        make_pkt(2, 1, 1, 400, 2),
-    };
-    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-        switch_process(sw, &pkts[i]);
-    ps_process(sw);
-    print_stats(sw, 8);
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-/*
- * TEST 4: 强制冲突 + 重传解救（展示论文 §3.7 可靠性机制）
- */
-void test4_resend_recovery(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 4: Pool=1, 强制冲突 + Worker 重传解救孤儿聚合器\n");
-    printf("########################################\n");
-
-    atp_switch_t *sw = switch_create(1);
-
-    /* 阶段1：正常发送，制造孤儿聚合器 */
-    atp_packet_t pkts[] = {
-        make_pkt(1, 0, 0, 10, 2),   /* Job1 W0 预留槽位0 */
-        make_pkt(2, 0, 0, 100, 2),  /* Job2 W0 冲突 -> 回退PS */
-        make_pkt(1, 0, 1, 20, 2),   /* Job1 W1 -> 完成，释放槽位0 */
-        make_pkt(2, 0, 1, 200, 2),  /* Job2 W1 -> 预留槽位0（现在卡住了，等不到W0） */
-    };
-    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-        switch_process(sw, &pkts[i]);
-
-    /* 阶段2：模拟"Worker 发现超时，重传 Job2 Seq0 W0" */
-    printf("\n  --- Worker2 发现 ACK 超时，发起重传 ---\n");
-    atp_packet_t resend = make_pkt(2, 0, 0, 100, 2);
-    resend.resend = true;
-    switch_process(sw, &resend);
-
-    /* 阶段3：PS 处理所有包 */
-    ps_process(sw);
-    print_stats(sw, 5); /* 4 个原始包 + 1 个重传包 = 5 */
-
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-
-/*
- * TEST 5: 超时扫描（模拟 Worker 崩溃，无人重传）
- */
-void test5_orphan_timeout(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 5: Pool=1, Worker 崩溃，展示孤儿聚合器超时清理\n");
-    printf("########################################\n");
-
-    atp_switch_t *sw = switch_create(1);
-    atp_packet_t pkts[] = {
-        make_pkt(1, 0, 0, 10, 2),   /* W0 预留 */
-        /* W1 永远不来（Worker 崩溃） */
-    };
-    switch_process(sw, &pkts[0]);
-
-    printf("\n  --- 模拟时间推进，扫描超时(阈值=3)---\n");
-    sw->global_time = 5; /* 快进时间 */
-    switch_scan_timeout(sw, 3);
-
-    /* 槽位已被清理，新 Job 可以进来 */
-    atp_packet_t late = make_pkt(2, 0, 0, 999, 2);
-    switch_process(sw, &late);
-
-    ps_process(sw);
-    print_stats(sw, 2);
-
-    free(sw->pool); free(sw->ps_queue); free(sw);
-    printf("  [Note] Job1 数据已丢失，需 Worker 重传或 PS 请求重传才能恢复\n");
+/* 设置拒绝旧迭代的持久标记并压紧墓碑表；调用者已检查该作业存在且待回收槽全部排空。 */
+static void retire_switch(atp_switch *sw,uint32_t id,uint32_t through) {
+    atp_job *job=find_job(sw->jobs,sw->job_count,id);
+    if(!job) return; 
+    job->retired=true;job->retired_iteration=through;
+    /* kept 是压紧数组时保留项的写入下标；仅移除指定回收区间内的项。 */
+    unsigned kept=0;
+    for(unsigned i=0;i<sw->closed_count;++i)
+        if(!affected(sw->closed[i],id,through)) sw->closed[kept++]=sw->closed[i];
+    sw->closed_count=kept;
     
 }
-
-/* ============================================================
- *  新增 Test 6：验证 rescued 机制
- * ============================================================ */
-void test6_rescued_mechanism(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 6: 验证 rescued 机制（重传解救后，同 Job 同 Seq 的新包直发 PS）\n");
-    printf("########################################\n");
-
-    atp_switch_t *sw = switch_create(1);
-
-    /* 阶段1：制造冲突与孤儿聚合器 */
-    atp_packet_t pkts[] = {
-        make_pkt(1, 0, 0, 10, 2),   /* Job1 Seq0 W0 预留槽位0 */
-        make_pkt(2, 0, 0, 100, 2),  /* Job2 Seq0 W0 冲突 -> 回退PS */
-        make_pkt(1, 0, 1, 20, 2),   /* Job1 Seq0 W1 -> 完成，释放槽位0 */
-        make_pkt(2, 0, 1, 200, 2),  /* Job2 Seq0 W1 -> 预留槽位0（等W0） */
-    };
-    for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-        switch_process(sw, &pkts[i]);
-
-    /* 阶段2：W0 重传，解救孤儿聚合器 */
-    printf("\n  --- Job2 W0 超时重传，触发解救 ---\n");
-    atp_packet_t resend = make_pkt(2, 0, 0, 100, 2);
-    resend.resend = true;
-    switch_process(sw, &resend);
-
-    /* 阶段3：同 Job 同 Seq 的新包（非重传）到达 —— 应被直发 PS，禁止预留 */
-    printf("\n  --- Job2 Seq0 W0 新包（延迟到达/重复），应被直发 PS ---\n");
-    atp_packet_t late_pkt = make_pkt(2, 0, 0, 100, 2);
-    late_pkt.resend = false;
-    switch_process(sw, &late_pkt);
-
-    ps_process(sw);
-    print_stats(sw, 6);
-
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-
-
-/* ============================================================
- *  新增 Test 7：ECN 拥塞控制 + 出口队列出队验证
- * ============================================================ */
-void test7_ecn_congestion(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 7: ECN 拥塞控制（出口队列深度超阈值标记 ECN）+ 出口队列出队验证\n");
-    printf("########################################\n");
-
-    atp_switch_t *sw = switch_create(4);  /* Pool 充足，排除冲突干扰 */
-    sw->ecn_threshold = 0;                /* 关键：阈值设为 0，任何非空队列即标记拥塞 */
-    
-    /*
-     * 场景设计（4 个包，2 个 Job，每个 Job 2 个 Worker）：
-     *
-     * 包1: Job1 Seq0 W0 -> 预留槽位，不发 PS。到达时 depth=0，ECN=0。
-     * 包2: Job1 Seq0 W1 -> 完成聚合，send_to_ps，depth 变为 1。到达时 depth=0，ECN=0。
-     *
-     * 包3: Job2 Seq0 W0 -> 到达时 depth=1 > threshold(0)，被标记 ECN=1；预留槽位。
-     * 包4: Job2 Seq0 W1 -> 到达时 depth=1 > threshold(0)，被标记 ECN=1；完成聚合，
-     *      send_to_ps，depth 变为 2。聚合器继承 ECN=1。
-     *
-     * 预期结果：
-     *   - Job1 结果包：ECN=0（未经历拥塞）
-     *   - Job2 结果包：ECN=1（经历拥塞，且聚合器 OR 了 ECN）
-     */
-    // atp_packet_t pkts[] = {
-    //     make_pkt(1, 0, 0, 10, 2),   /* Job1 W0 */
-    //     make_pkt(1, 0, 1, 20, 2),   /* Job1 W1 -> 完成，发 PS，depth=1 */
-    //     make_pkt(2, 0, 0, 100, 2),  /* Job2 W0 -> depth=1>0，ECN=1 */
-    //     make_pkt(2, 0, 1, 200, 2),  /* Job2 W1 -> depth=1>0，ECN=1，聚合结果 ECN=1 */
-    // };
-    // for (size_t i = 0; i < sizeof(pkts)/sizeof(pkts[0]); i++)
-    //     switch_process(sw, &pkts[i]);
-
-
-    /* ========== 阶段 1：Job1 的两个 Worker 包 ========== */
-    atp_packet_t job1_w0 = make_pkt(1, 0, 0, 10, 2);
-    atp_packet_t job1_w1 = make_pkt(1, 0, 1, 20, 2);
-
-    switch_process(sw, &job1_w0);  /* 预留，不发 PS */
-    switch_process(sw, &job1_w1);  /* 完成聚合 -> send_to_ps，depth=1 */
-
-    printf("\n  --- 阶段 1 结束：Switch 出口队列深度=%u ---\n", sw->egress_queue_depth);
-
-    /* ========== 阶段 2：PS 取走包，队列清空 ========== */
-    ps_process(sw);
-    printf("  --- 阶段 2 结束：PS 处理完成，队列深度=%u ---\n", sw->egress_queue_depth);
-
-    /* ========== 阶段 3：Job2 的新包到达（此时队列应为空） ========== */
-    atp_packet_t job2_w0 = make_pkt(2, 0, 0, 100, 2);
-    atp_packet_t job2_w1 = make_pkt(2, 0, 1, 200, 2);
-
-    switch_process(sw, &job2_w0);  /* 预期：depth=0，ECN=0 */
-    switch_process(sw, &job2_w1);  /* 预期：depth=0，ECN=0 */
-
-    printf("\n  --- 阶段 3 结束：Job2 包处理完毕 ---\n");
-
-    /* ========== 阶段 4：PS 处理剩余包 ========== */
-
-    ps_process(sw);
-    print_stats(sw, 4);
-
-    free(sw->pool); free(sw->ps_queue); free(sw);
-}
-
-void test8_inter_rack(void)
-{
-    printf("\n\n########################################\n");
-    printf("TEST 8: 多级聚合 Inter-rack (2 L1 + 1 L2，验证跨机架等待聚合)\n");
-    printf("########################################\n");
-
-    /* 拓扑：2 个 Worker 机架 + 1 个 PS 机架 */
-    atp_switch_t *sw0 = switch_create_with_id(4, 0);  /* L1: Rack A */
-    atp_switch_t *sw1 = switch_create_with_id(4, 1);  /* L1: Rack B */
-    atp_switch_t *sw2 = switch_create_with_id(4, 2);  /* L2: PS-ToR */
-
-    /* Job1: 4 workers，跨 2 个机架，每个机架 2 人 */
-    /* Rack A: Worker 0, 1 */
-    atp_packet_t w0 = make_pkt(1, 0, 0, 10, 4);
-    w0.fanInDegree0 = 2;
-    w0.fanInDegree1 = 2;
-
-    atp_packet_t w1 = make_pkt(1, 0, 1, 20, 4);
-    w1.fanInDegree0 = 2;
-    w1.fanInDegree1 = 2;
-
-    /* Rack B: Worker 2, 3 */
-    atp_packet_t w2 = make_pkt(1, 0, 2, 30, 4);
-    w2.fanInDegree0 = 2;
-    w2.fanInDegree1 = 2;
-
-    atp_packet_t w3 = make_pkt(1, 0, 3, 40, 4);
-    w3.fanInDegree0 = 2;
-    w3.fanInDegree1 = 2;
-
-    /* Stage 1: L1 处理 */
-    printf("  --- Stage 1: SW0(L1) 处理 Rack A ---\n");
-    switch_process(sw0, &w0);
-    switch_process(sw0, &w1);
-
-    printf("\n  --- Stage 1: SW1(L1) 处理 Rack B ---\n");
-    switch_process(sw1, &w2);
-    switch_process(sw1, &w3);
-
-    /* Stage 2: 串联 L1 输出到 L2 */
-    printf("\n  --- Stage 2: 将 L1 聚合结果送 L2 ---\n");
-    
-    /* 先送 SW0 的部分和（此时 L2 应预留等待） */
-    for (uint32_t i = 0; i < sw0->ps_tail; i++) {
-        atp_packet_t *p = &sw0->ps_queue[i];
-        if (p->from_switch && p->edgeSwitchIdentifier == 1) {
-            printf("  [Relay] SW0->SW2: Job%d Seq%d 部分和=%d count=%d bitmap1=%u\n",
-                   p->job_id, p->seq, p->data, p->count, p->bitmap1);
-            switch_process(sw2, p);
-        }
+/* 先验证分片、事件、槽均满足回收条件，再设置旧迭代拒绝标记并回收存储；allow_failed 允许回收终止失败项。 */
+static bool reclaim(atp_sim *sim,uint32_t id,uint32_t through,bool allow_failed) {
+    if(!sim) return false;
+    atp_job *job=find_job(sim->jobs,sim->job_count,id);
+    if(!job || (job->retired && through<=job->retired_iteration)) return false;
+    if(!find_job(sim->l2.jobs,sim->l2.job_count,id)) return false;
+    for(unsigned r=0;r<sim->racks;++r)
+        if(!find_job(sim->l1[r].jobs,sim->l1[r].job_count,id)) return false;
+    for(unsigned i=0;i<sim->count;++i) {
+        atp_fragment *f=&sim->fragments[i];
+        bool completed=f->done && !f->failed && f->acked==f->members;
+        if(affected(f->key,id,through) && !completed && !(allow_failed && f->failed)) return false;
     }
-
-    /* 再送 SW1 的部分和（此时 L2 应收齐并完成） */
-    for (uint32_t i = 0; i < sw1->ps_tail; i++) {
-        atp_packet_t *p = &sw1->ps_queue[i];
-        if (p->from_switch && p->edgeSwitchIdentifier == 1) {
-            printf("  [Relay] SW1->SW2: Job%d Seq%d 部分和=%d count=%d bitmap1=%u\n",
-                   p->job_id, p->seq, p->data, p->count, p->bitmap1);
-            switch_process(sw2, p);
+    for(unsigned i=0;i<ATP_EVENTS;++i)
+        if(sim->events[i].used && affected(sim->events[i].packet.key,id,through)) return false;
+    if(!can_retire_switch(&sim->l2,id,through)) return false;
+    for(unsigned r=0;r<sim->racks;++r) if(!can_retire_switch(&sim->l1[r],id,through)) return false;
+    
+    /* 单线程回收屏障：先安装拒绝旧迭代的标记，再释放输入/PS 状态；不是已实现的分布式屏障。 */
+    job->retired=true;job->retired_iteration=through;retire_switch(&sim->l2,id,through);
+    for(unsigned r=0;r<sim->racks;++r) retire_switch(&sim->l1[r],id,through);
+    /* kept 是压紧数组时保留项的写入下标；仅移除指定回收区间内的项。 */
+    unsigned kept=0;
+    for(unsigned i=0;i<sim->count;++i) {
+        if(affected(sim->fragments[i].key,id,through)) {
+            ++sim->retired_fragments;
+            if(sim->fragments[i].failed) ++sim->aborted_fragments;
         }
+        else sim->fragments[kept++]=sim->fragments[i];
     }
-
-    /* Stage 2.5: 验证 L2 重传直接透传（§3.7） */
-    printf("\n  --- Stage 2.5: 模拟重传包到达 L2，验证直接透传 ---\n");
-    atp_packet_t resend_l2 = make_pkt(1, 0, 0, 10, 4);
-    resend_l2.resend = true;
-    resend_l2.edgeSwitchIdentifier = 1;
-    resend_l2.fanInDegree0 = 2;
-    resend_l2.fanInDegree1 = 2;
-    resend_l2.count = 2;  /* 模拟 L1 部分和 */
-    switch_process(sw2, &resend_l2);
-
-    /* Stage 3: PS 处理 */
-    ps_process(sw2);
-
-    printf("\n========== L1(SW0) 统计 ==========\n");
-    printf("完成聚合: %lu, 回退: %lu\n", sw0->completed, sw0->fallback);
-    printf("========== L1(SW1) 统计 ==========\n");
-    printf("完成聚合: %lu, 回退: %lu\n", sw1->completed, sw1->fallback);
-    printf("========== L2(SW2) 统计 ==========\n");
-    printf("完成聚合: %lu, 回退: %lu\n", sw2->completed, sw2->fallback);
-
-    free(sw0->pool); free(sw0->ps_queue); free(sw0);
-    free(sw1->pool); free(sw1->ps_queue); free(sw1);
-    free(sw2->pool); free(sw2->ps_queue); free(sw2);
+    memset(&sim->fragments[kept],0,(sim->count-kept)*sizeof(sim->fragments[0]));sim->count=kept;
+    for(unsigned i=0;i<ATP_FLOWS;++i)
+        if(sim->flows[i].used && affected(sim->flows[i].id,id,through)) memset(&sim->flows[i],0,sizeof(sim->flows[i]));
+    return true;
 }
-
-int main(void)
-{
-    test1_no_contention();
-    test2_contention_and_fallback();
-    test3_dynamic_reuse();
-    test4_resend_recovery();
-    test5_orphan_timeout();
-    test6_rescued_mechanism();
-    test7_ecn_congestion();
-    test8_inter_rack();
-    printf("\n\n全部测试通过。\n");
-    return 0;
+/* 回收指定作业中 iteration <= through_iteration 的成功分片；要求全部 ACK 到达且相关事件/槽已排空。 */
+bool atp_sim_retire(atp_sim *sim,uint32_t id,uint32_t through) {
+    return reclaim(sim,id,through,false);
 }
+/* 显式回收终止失败分片（也可含已成功项）；不是取消正在执行的工作，同样要求相关事件/槽排空。 */
+bool atp_sim_abort(atp_sim *sim,uint32_t id,uint32_t through) {
+    return reclaim(sim,id,through,true);
+}
+/* 测试构建定义 ATP_NO_MAIN 后不编译演示入口，由 tests/test_atp.c 提供 main。 */
+#ifndef ATP_NO_MAIN
+/* 最小演示：4 个 Worker、2 个机架、每台交换机 2 个槽，注入 DATA/ACK 丢包后检查闭环完成情况。 */
+int main(void) {
+    atp_sim *sim=atp_sim_create(4,2,2);if(!sim) return EXIT_FAILURE;
+    atp_input values={0};
+    for(unsigned w=0;w<4;++w) for(unsigned v=0;v<ATP_VALUES;++v) values.value[w][v]=(int32_t)((w+1)*(v+1));
+    bool ok=atp_sim_add(sim,(atp_key){1,1,0,0},&values);
+    sim->drop_next[ATP_TO_PS]=1;sim->drop_next[ATP_ACK_WORKER]=1;ok=ok && atp_sim_run(sim,5000);
+    printf("ATP closed-loop demo: %s; sum=%" PRId64 ", mask=%" PRIu32 ", retries=%" PRIu64 ", drops=%" PRIu64 "\n",
+           ok ? "completed" : "FAILED",sim->fragments[0].sum[0],sim->fragments[0].seen,sim->retries,sim->drops);
+    atp_sim_destroy(sim);return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+#endif
